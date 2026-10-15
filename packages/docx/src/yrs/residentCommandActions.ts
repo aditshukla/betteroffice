@@ -614,6 +614,23 @@ export function applyDocxCommand(
   engine: ResidentDocxCommandEngine,
   state: ResidentDocxCommandState,
   prepared: PreparedDocxCommand,
+  context: DocxCommandApplyContext,
+  environment?: ResidentCommandHooksEnvironment
+): DocxCommandApplyResult {
+  const { inputTime, lastInputTime } = prepared.command;
+  if (inputTime === undefined) return applyPreparedDocxCommand(engine, state, prepared, context, environment);
+  engine.setUndoInputTime([inputTime, lastInputTime ?? inputTime]);
+  try {
+    return applyPreparedDocxCommand(engine, state, prepared, context, environment);
+  } finally {
+    engine.setUndoInputTime(null);
+  }
+}
+
+function applyPreparedDocxCommand(
+  engine: ResidentDocxCommandEngine,
+  state: ResidentDocxCommandState,
+  prepared: PreparedDocxCommand,
   _context: DocxCommandApplyContext,
   environment?: ResidentCommandHooksEnvironment
 ): DocxCommandApplyResult {
