@@ -3,12 +3,23 @@
 
 use quick_xml::events::{BytesStart, Event};
 use xlsx_model::styles::{
-    Alignment, Border, BorderEdge, BorderStyle, Color, Fill, Font, HAlign, Stylesheet, Theme,
-    VAlign, Xf,
+    Alignment, Border, BorderEdge, BorderStyle, Color, Fill, Font, HAlign, PatternType, Protection,
+    SavedPlain, Stylesheet, Theme, VAlign, Xf,
 };
 
-use crate::xml::{attr, local_name, next_event, reader};
+use crate::xml::{attr, local_name, next_event, reader, xml_err};
 use crate::{MAX_STYLE_ENTRIES, ParseError};
+
+#[cfg(feature = "test-counters")]
+thread_local! {
+    static LEGACY_STYLE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(feature = "test-counters")]
+#[doc(hidden)]
+pub fn legacy_style_reads() -> u64 {
+    LEGACY_STYLE_READS.get()
+}
 
 /// build the stylesheet from the optional style and theme parts; either falls
 /// back to the model defaults.
@@ -33,11 +44,35 @@ pub(crate) fn parse_stylesheet(
     Ok((sheet, legacy))
 }
 
-/// which top-level pool the cursor is inside; disambiguates elements that recur
-/// across sections (`<xf>` in cellStyleXfs vs cellXfs, `<color>` everywhere).
+pub(crate) fn legacy_style_readings(
+    styles: Option<&[u8]>,
+    sheet: &Stylesheet,
+    legacy: Option<&Stylesheet>,
+    references_zero_style: bool,
+) -> Result<Vec<Stylesheet>, ParseError> {
+    let mut readings = Vec::new();
+    if let Some(bytes) = styles {
+        let (mut unfiltered, xfs) = parse_style_pools(bytes, true)?;
+        unfiltered.theme = sheet.theme.clone();
+        let mut held = unfiltered.clone();
+        held.cell_xfs = xfs;
+        for mut reading in [unfiltered, held] {
+            if reading.cell_xfs.is_empty() && references_zero_style {
+                reading.cell_xfs.push(Xf::default());
+            }
+            if &reading != sheet && legacy != Some(&reading) && !readings.contains(&reading) {
+                readings.push(reading);
+            }
+        }
+    }
+    Ok(readings)
+}
+
+/// A stylesheet pool selected by logical parentage.
 #[derive(PartialEq)]
 enum Section {
     None,
+    NumFmts,
     Fonts,
     Fills,
     Borders,
@@ -48,9 +83,26 @@ enum Section {
 /// parse the style pools (numFmts, fonts, fills, borders, cellXfs). the theme is
 /// filled in by the caller.
 fn parse_styles(data: &[u8]) -> Result<(Stylesheet, Vec<Xf>), ParseError> {
+    parse_style_pools(data, false)
+}
+
+struct Scope {
+    depth: usize,
+    read: bool,
+    transparent: bool,
+    alternate: bool,
+    taken: bool,
+}
+
+fn parse_style_pools(data: &[u8], unfiltered: bool) -> Result<(Stylesheet, Vec<Xf>), ParseError> {
+    #[cfg(feature = "test-counters")]
+    if unfiltered {
+        LEGACY_STYLE_READS.set(LEGACY_STYLE_READS.get() + 1);
+    }
     let mut reader = reader(data);
     let mut buf = Vec::new();
-    let mut depth = 0;
+    let mut physical_depth = 0;
+    let mut scopes: Vec<Scope> = Vec::new();
 
     let mut ss = Stylesheet::default();
     let mut section = Section::None;
@@ -60,12 +112,62 @@ fn parse_styles(data: &[u8]) -> Result<(Stylesheet, Vec<Xf>), ParseError> {
     let mut edge: Option<(u8, BorderEdge)> = None;
     let mut xf: Option<Xf> = None;
     let mut explicit = [false; 4];
+    let mut protection_applied = true;
     let mut legacy_cell_xfs: Vec<Xf> = Vec::new();
     let mut colors_depth = None;
     let mut indexed_colors_depth = None;
+    let mut markup: Option<Markup> = None;
+    let mut default_fonts = Vec::new();
+    let mut default_fills = Vec::new();
+    let mut default_borders = Vec::new();
+    let mut plain_xfs = Vec::new();
 
     loop {
-        match next_event(&mut reader, &mut buf, &mut depth)? {
+        let event = next_event(&mut reader, &mut buf, &mut physical_depth)?;
+        let depth = if unfiltered {
+            physical_depth
+        } else {
+            match &event {
+                Event::Start(e) => {
+                    let name = local_name(e);
+                    let parent = scopes.last_mut();
+                    let mut read = parent.as_ref().is_none_or(|parent| parent.read);
+                    let parent_depth = parent.as_ref().map_or(0, |parent| parent.depth);
+                    let alternate = name == b"AlternateContent";
+                    let branch = matches!(name.as_slice(), b"Choice" | b"Fallback")
+                        && parent.as_ref().is_some_and(|parent| parent.alternate);
+                    if branch && let Some(parent) = parent {
+                        read &= !parent.taken;
+                        parent.taken = true;
+                    }
+                    let transparent = alternate || branch;
+                    let depth = parent_depth + usize::from(!transparent);
+                    scopes.push(Scope {
+                        depth,
+                        read,
+                        transparent,
+                        alternate,
+                        taken: false,
+                    });
+                    if !read || transparent {
+                        continue;
+                    }
+                    depth
+                }
+                Event::End(_) => {
+                    let scope = scopes.pop();
+                    if scope.is_some_and(|scope| !scope.read || scope.transparent) {
+                        continue;
+                    }
+                    scopes.last().map_or(0, |scope| scope.depth)
+                }
+                _ => scopes.last().map_or(0, |scope| scope.depth),
+            }
+        };
+        if let (Event::Start(e), Some(open)) = (&event, markup.as_mut()) {
+            open.child(e, depth)?;
+        }
+        match event {
             Event::Start(e) => match local_name(&e).as_slice() {
                 b"colors" if depth == 2 => colors_depth = Some(depth),
                 b"indexedColors" if colors_depth == Some(depth - 1) => {
@@ -81,13 +183,19 @@ fn parse_styles(data: &[u8]) -> Result<(Stylesheet, Vec<Xf>), ParseError> {
                     };
                     ss.indexed_colors.push(rgb);
                 }
-                b"numFmts" => section = Section::None,
-                b"fonts" => section = Section::Fonts,
-                b"fills" => section = Section::Fills,
-                b"borders" => section = Section::Borders,
-                b"cellStyleXfs" => section = Section::CellStyleXfs,
-                b"cellXfs" => section = Section::CellXfs,
-                b"numFmt" => {
+                b"numFmts" if unfiltered || depth == 2 => {
+                    section = if unfiltered {
+                        Section::None
+                    } else {
+                        Section::NumFmts
+                    }
+                }
+                b"fonts" if unfiltered || depth == 2 => section = Section::Fonts,
+                b"fills" if unfiltered || depth == 2 => section = Section::Fills,
+                b"borders" if unfiltered || depth == 2 => section = Section::Borders,
+                b"cellStyleXfs" if unfiltered || depth == 2 => section = Section::CellStyleXfs,
+                b"cellXfs" if unfiltered || depth == 2 => section = Section::CellXfs,
+                b"numFmt" if unfiltered || (section == Section::NumFmts && depth == 3) => {
                     if let (Some(id), Some(code)) = (
                         attr(&e, b"numFmtId")?.and_then(|v| v.parse::<u16>().ok()),
                         attr(&e, b"formatCode")?,
@@ -96,9 +204,18 @@ fn parse_styles(data: &[u8]) -> Result<(Stylesheet, Vec<Xf>), ParseError> {
                         ss.num_fmts.push((id, code));
                     }
                 }
-                b"font" if section == Section::Fonts => font = Some(Font::default()),
-                b"fill" if section == Section::Fills => fill = Some(Fill::None),
-                b"border" if section == Section::Borders => border = Some(Border::default()),
+                b"font" if section == Section::Fonts && (unfiltered || depth == 3) => {
+                    font = Some(Font::default());
+                    markup = Some(Markup::open(Entry::Font, &e, depth)?);
+                }
+                b"fill" if section == Section::Fills && (unfiltered || depth == 3) => {
+                    fill = Some(Fill::None);
+                    markup = Some(Markup::open(Entry::Fill, &e, depth)?);
+                }
+                b"border" if section == Section::Borders && (unfiltered || depth == 3) => {
+                    border = Some(Border::default());
+                    markup = Some(Markup::open(Entry::Border, &e, depth)?);
+                }
                 b"b" if font.is_some() => set_bool(&e, &mut font, |f| &mut f.bold)?,
                 b"i" if font.is_some() => set_bool(&e, &mut font, |f| &mut f.italic)?,
                 b"u" if font.is_some() => set_bool(&e, &mut font, |f| &mut f.underline)?,
@@ -117,14 +234,33 @@ fn parse_styles(data: &[u8]) -> Result<(Stylesheet, Vec<Xf>), ParseError> {
                     font.as_mut().unwrap().color = parse_color(&e)?;
                 }
                 b"patternFill" if fill.is_some() => {
-                    if attr(&e, b"patternType")?.as_deref() != Some("none") {
-                        // any non-none pattern collapses to solid auto until fgColor is seen
-                        *fill.as_mut().unwrap() = Fill::Solid(Color::Auto);
-                    }
+                    let token = attr(&e, b"patternType")?;
+                    *fill.as_mut().unwrap() = match token.as_deref() {
+                        Some("none") => Fill::None,
+                        token => match token.and_then(PatternType::from_sml) {
+                            Some(pattern) => Fill::Pattern {
+                                pattern,
+                                fg: None,
+                                bg: None,
+                            },
+                            None => Fill::Solid(Color::Auto),
+                        },
+                    };
                 }
                 b"fgColor" if fill.is_some() => {
-                    if let Some(c) = parse_color(&e)? {
-                        *fill.as_mut().unwrap() = Fill::Solid(c);
+                    let color = parse_color(&e)?;
+                    match fill.as_mut().unwrap() {
+                        Fill::Pattern { fg, .. } => *fg = color,
+                        other => {
+                            if let Some(color) = color {
+                                *other = Fill::Solid(color);
+                            }
+                        }
+                    }
+                }
+                b"bgColor" if fill.is_some() => {
+                    if let Fill::Pattern { bg, .. } = fill.as_mut().unwrap() {
+                        *bg = parse_color(&e)?;
                     }
                 }
                 b"left" | b"start" if border.is_some() => edge = begin_edge(&e, 0)?,
@@ -136,10 +272,12 @@ fn parse_styles(data: &[u8]) -> Result<(Stylesheet, Vec<Xf>), ParseError> {
                         ed.color = parse_color(&e)?;
                     }
                 }
-                b"xf" if section == Section::CellXfs => {
+                b"xf" if section == Section::CellXfs && (unfiltered || depth == 3) => {
                     let (parsed, flags) = parse_xf(&e)?;
                     xf = Some(parsed);
                     explicit = flags;
+                    markup = Some(Markup::open(Entry::Xf, &e, depth)?);
+                    protection_applied = applied(&e, b"applyProtection")?.0;
                 }
                 b"alignment" if xf.is_some() && section == Section::CellXfs => {
                     let a = parse_alignment(&e)?;
@@ -147,8 +285,20 @@ fn parse_styles(data: &[u8]) -> Result<(Stylesheet, Vec<Xf>), ParseError> {
                         xf.as_mut().unwrap().alignment = Some(a);
                     }
                 }
+                b"protection"
+                    if xf.is_some() && section == Section::CellXfs && protection_applied =>
+                {
+                    xf.as_mut().unwrap().protection = Some(Protection {
+                        locked: attr(&e, b"locked")?.map(|v| is_truthy(&v)).unwrap_or(true),
+                        hidden: attr(&e, b"hidden")?.is_some_and(|v| is_truthy(&v)),
+                    });
+                }
                 _ => {}
             },
+            Event::End(_) if !unfiltered && depth == 1 => {
+                section = Section::None;
+                colors_depth = None;
+            }
             Event::End(e) => match e.name().local_name().as_ref() {
                 b"colors" if colors_depth == Some(depth + 1) => colors_depth = None,
                 b"indexedColors" if indexed_colors_depth == Some(depth + 1) => {
@@ -158,18 +308,21 @@ fn parse_styles(data: &[u8]) -> Result<(Stylesheet, Vec<Xf>), ParseError> {
                     if let Some(f) = font.take() {
                         cap(ss.fonts.len())?;
                         ss.fonts.push(f);
+                        default_fonts.push(markup.take().is_some_and(|open| open.plain));
                     }
                 }
                 b"fill" => {
                     if let Some(f) = fill.take() {
                         cap(ss.fills.len())?;
                         ss.fills.push(f);
+                        default_fills.push(markup.take().is_some_and(|open| open.plain));
                     }
                 }
                 b"border" => {
                     if let Some(b) = border.take() {
                         cap(ss.borders.len())?;
                         ss.borders.push(b);
+                        default_borders.push(markup.take().is_some_and(|open| open.plain));
                     }
                 }
                 b"left" | b"start" | b"right" | b"end" | b"top" | b"bottom" => {
@@ -187,6 +340,9 @@ fn parse_styles(data: &[u8]) -> Result<(Stylesheet, Vec<Xf>), ParseError> {
                         cap(ss.cell_xfs.len())?;
                         legacy_cell_xfs.push(held_back(&x, explicit));
                         ss.cell_xfs.push(x);
+                        if let Some(open) = markup.take().filter(|open| open.plain) {
+                            plain_xfs.push((ss.cell_xfs.len() as u32 - 1, open.ids));
+                        }
                     }
                 }
                 _ => {}
@@ -195,7 +351,152 @@ fn parse_styles(data: &[u8]) -> Result<(Stylesheet, Vec<Xf>), ParseError> {
             _ => {}
         }
     }
+    let xf = plain_xfs
+        .into_iter()
+        .find(|&(index, [font, fill, border])| {
+            names_default(&default_fonts, font)
+                && names_default(&default_fills, fill)
+                && names_default(&default_borders, border)
+                && ss.resolved_format(Some(index)) == ss.resolved_format(None)
+        })
+        .map(|(index, _)| index);
+    ss.set_saved_plain(SavedPlain {
+        xf,
+        font: first_default(&default_fonts),
+        fill: first_default(&default_fills),
+        border: first_default(&default_borders),
+    });
     Ok((ss, legacy_cell_xfs))
+}
+
+/// The pool entries whose markup a save keeps while the model leaves them alone.
+#[derive(Clone, Copy)]
+enum Entry {
+    Font,
+    Fill,
+    Border,
+    Xf,
+}
+
+/// An entry being read: whether its markup so far is what a save writes for a default entry
+/// or the plain xf, and for an xf the font, fill and border it names.
+struct Markup {
+    entry: Entry,
+    depth: usize,
+    plain: bool,
+    ids: [u32; 3],
+}
+
+impl Markup {
+    fn open(entry: Entry, e: &BytesStart, depth: usize) -> Result<Self, ParseError> {
+        let ids = match entry {
+            Entry::Xf => plain_xf_ids(e)?,
+            _ => attributes_within(e, &[])?.then_some([0; 3]),
+        };
+        Ok(Self {
+            entry,
+            depth,
+            plain: ids.is_some(),
+            ids: ids.unwrap_or_default(),
+        })
+    }
+
+    /// A descendant keeps the entry plain only as a child a save writes for a default fill or
+    /// border, or a modeled alignment.
+    fn child(&mut self, e: &BytesStart, depth: usize) -> Result<(), ParseError> {
+        if !self.plain || depth <= self.depth {
+            return Ok(());
+        }
+        if depth > self.depth + 1 {
+            self.plain = false;
+            return Ok(());
+        }
+        let name = local_name(e);
+        self.plain = match self.entry {
+            Entry::Font => false,
+            Entry::Fill => {
+                name == b"patternFill"
+                    && attributes_within(e, &["patternType"])?
+                    && attr(e, b"patternType")?.as_deref() == Some("none")
+            }
+            Entry::Border => {
+                DEFAULT_BORDER_EDGES.contains(&name.as_slice()) && attributes_within(e, &[])?
+            }
+            Entry::Xf => name == b"alignment" && attributes_within(e, MODELED_ALIGNMENT)?,
+        };
+        Ok(())
+    }
+}
+
+const DEFAULT_BORDER_EDGES: &[&[u8]] = &[b"left", b"right", b"top", b"bottom", b"diagonal"];
+
+const MODELED_ALIGNMENT: &[&str] = &["horizontal", "vertical", "wrapText", "shrinkToFit"];
+
+const PLAIN_XF_ATTRIBUTES: &[&str] = &[
+    "numFmtId",
+    "fontId",
+    "fillId",
+    "borderId",
+    "xfId",
+    "applyNumberFormat",
+    "applyFont",
+    "applyFill",
+    "applyBorder",
+    "applyAlignment",
+];
+
+/// The font, fill and border an xf names when its attributes are ones a save writes for the
+/// plain xf: general number format, no parent style and no protection, prefix or pivot flags.
+fn plain_xf_ids(e: &BytesStart) -> Result<Option<[u32; 3]>, ParseError> {
+    if !attributes_within(e, PLAIN_XF_ATTRIBUTES)? {
+        return Ok(None);
+    }
+    for name in [b"numFmtId".as_slice(), b"xfId".as_slice()] {
+        if attr(e, name)?.is_some_and(|value| value != "0") {
+            return Ok(None);
+        }
+    }
+    let mut ids = [0; 3];
+    let names = [
+        b"fontId".as_slice(),
+        b"fillId".as_slice(),
+        b"borderId".as_slice(),
+    ];
+    for (id, name) in ids.iter_mut().zip(names) {
+        if let Some(value) = attr(e, name)? {
+            let Ok(value) = value.parse() else {
+                return Ok(None);
+            };
+            *id = value;
+        }
+    }
+    Ok(Some(ids))
+}
+
+fn attributes_within(e: &BytesStart, names: &[&str]) -> Result<bool, ParseError> {
+    for attribute in e.attributes() {
+        let attribute = attribute.map_err(xml_err)?;
+        if !names
+            .iter()
+            .any(|name| attribute.key.as_ref() == name.as_bytes())
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether the pool entry `id` names saves as the default entry: its markup does, or the
+/// source has no such entry.
+fn names_default(defaults: &[bool], id: u32) -> bool {
+    defaults.get(id as usize).copied().unwrap_or(true)
+}
+
+fn first_default(defaults: &[bool]) -> Option<u32> {
+    defaults
+        .iter()
+        .position(|default| *default)
+        .map(|index| index as u32)
 }
 
 /// reject a pool that would grow past the cap before pushing another entry.
@@ -257,6 +558,10 @@ fn parse_xf(e: &BytesStart) -> Result<(Xf, [bool; 4]), ParseError> {
             border: border_on.then_some(border).flatten(),
             num_fmt_id: num_fmt_on.then_some(num_fmt).flatten(),
             alignment: None,
+            protection: None,
+            xf_id: index_u32(e, b"xfId")?,
+            quote_prefix: attr(e, b"quotePrefix")?.is_some_and(|v| is_truthy(&v)),
+            pivot_button: attr(e, b"pivotButton")?.is_some_and(|v| is_truthy(&v)),
         },
         [font_set, fill_set, border_set, num_fmt_set],
     ))
@@ -279,7 +584,7 @@ fn held_back(xf: &Xf, explicit: [bool; 4]) -> Xf {
         fill: explicit[1].then_some(xf.fill).flatten(),
         border: explicit[2].then_some(xf.border).flatten(),
         num_fmt_id: explicit[3].then_some(xf.num_fmt_id).flatten(),
-        alignment: xf.alignment.clone(),
+        ..xf.clone()
     }
 }
 
@@ -302,6 +607,11 @@ fn parse_alignment(e: &BytesStart) -> Result<Alignment, ParseError> {
         shrink_to_fit: attr(e, b"shrinkToFit")?
             .map(|v| is_truthy(&v))
             .unwrap_or(false),
+        text_rotation: index_u16(e, b"textRotation")?,
+        indent: index_u32(e, b"indent")?,
+        relative_indent: attr(e, b"relativeIndent")?.and_then(|v| v.parse::<i32>().ok()),
+        justify_last_line: attr(e, b"justifyLastLine")?.map(|v| is_truthy(&v)),
+        reading_order: index_u32(e, b"readingOrder")?,
     })
 }
 
@@ -418,4 +728,46 @@ fn slot_index(name: &[u8]) -> Option<usize> {
 
 fn is_truthy(v: &str) -> bool {
     matches!(v, "1" | "true" | "on")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_facets_child_apply_flags_and_defaults() {
+        for (flags, protected) in [
+            ("", true),
+            (r#"applyAlignment="1" applyProtection="true""#, true),
+            (r#"applyAlignment="0" applyProtection="false""#, false),
+        ] {
+            let xml = format!(
+                r#"<styleSheet><cellXfs><xf xfId="1" quotePrefix="true" pivotButton="1" {flags}>
+<alignment horizontal="center" textRotation="0" indent="0" relativeIndent="0" justifyLastLine="0" readingOrder="0"/>
+<protection hidden="1"/></xf></cellXfs></styleSheet>"#
+            );
+            let (styles, _) = parse_styles(xml.as_bytes()).unwrap();
+            let xf = &styles.cell_xfs[0];
+            assert_eq!(xf.xf_id, Some(1));
+            assert!(xf.quote_prefix);
+            assert!(xf.pivot_button);
+            assert_eq!(
+                xf.alignment,
+                Some(Alignment {
+                    h: Some(HAlign::Center),
+                    text_rotation: Some(0),
+                    indent: Some(0),
+                    relative_indent: Some(0),
+                    justify_last_line: Some(false),
+                    reading_order: Some(0),
+                    ..Default::default()
+                })
+            );
+            let protection = Protection {
+                locked: true,
+                hidden: true,
+            };
+            assert_eq!(xf.protection, protected.then_some(protection));
+        }
+    }
 }

@@ -86,10 +86,34 @@ pub enum Op {
         col: ColId,
         width: Option<f64>,
     },
+    SetColVisibility {
+        sheet: SheetId,
+        col: ColId,
+        hidden: bool,
+    },
+    #[doc(hidden)]
+    RestoreColDimension {
+        sheet: SheetId,
+        col: ColId,
+        width: Option<f64>,
+        hidden_width: Option<f64>,
+    },
     SetRowHeight {
         sheet: SheetId,
         row: RowId,
         height: Option<f64>,
+    },
+    SetRowVisibility {
+        sheet: SheetId,
+        row: RowId,
+        hidden: bool,
+    },
+    #[doc(hidden)]
+    RestoreRowDimension {
+        sheet: SheetId,
+        row: RowId,
+        height: Option<f64>,
+        hidden_height: Option<f64>,
     },
     SetFreezePane {
         sheet: SheetId,
@@ -112,6 +136,11 @@ pub enum Op {
     RestoreColStyles {
         sheet: SheetId,
         styles: Vec<ColStyle>,
+    },
+    #[doc(hidden)]
+    RestoreRowStyles {
+        sheet: SheetId,
+        styles: std::collections::BTreeMap<RowId, u32>,
     },
     /// Absolute replacement emitted as the inverse of a chart remap.
     #[doc(hidden)]
@@ -162,6 +191,10 @@ pub enum Op {
     },
     RemoveSheet {
         index: usize,
+    },
+    MoveSheet {
+        from: usize,
+        to: usize,
     },
     RenameSheet {
         sheet: SheetId,

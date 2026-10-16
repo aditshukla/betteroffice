@@ -15,7 +15,7 @@ use crate::drawing::parse_run_properties;
 use crate::model::{Bullet, PptxPackage, RunProperties, ShapeElements, SlideReference};
 use crate::xml::{
     DRAWINGML_NS, PRESENTATIONML_NS, ParseBudget, ParseLimits, XmlElement, XmlNode,
-    alternate_content_branch_index, parse_xml, serialize_xml,
+    alternate_content_branch_index, parse_xml, serialize_xml, serialize_xml_fragment,
 };
 
 const OFFICE_RELATIONSHIPS_NS: &str =
@@ -51,6 +51,10 @@ pub enum SlideWrite {
     Keep { part_path: String },
     /// Patch the source part; `shapes` is the full top-level list in final order.
     Patch {
+        part_path: String,
+        shapes: Vec<ShapeWrite>,
+    },
+    Clone {
         part_path: String,
         shapes: Vec<ShapeWrite>,
     },
@@ -120,6 +124,7 @@ pub enum TextTarget {
 pub struct ParagraphWrite {
     /// Index of the paragraph in the source text body, when it survives.
     pub source_index: Option<usize>,
+    pub preserved_xml: Option<String>,
     /// `false` keeps the source paragraph verbatim.
     pub rebuild: bool,
     pub properties_changed: bool,
@@ -170,7 +175,7 @@ pub fn write_pptx_with_edits(
             SlideWrite::Keep { part_path } | SlideWrite::Patch { part_path, .. } => {
                 Some(part_path.as_str())
             }
-            SlideWrite::Add { .. } => None,
+            SlideWrite::Add { .. } | SlideWrite::Clone { .. } => None,
         })
         .collect();
     let removed: Vec<&SlideReference> = package
@@ -190,6 +195,7 @@ pub fn write_pptx_with_edits(
     let mut structural = false;
     let mut final_order: Vec<FinalSlide<'_>> = Vec::new();
     let mut minted_by_slide: HashMap<usize, usize> = HashMap::new();
+    let mut cloned_dependencies = Vec::new();
     {
         let mut sink = PartSink {
             package,
@@ -231,11 +237,7 @@ pub fn write_pptx_with_edits(
                         .ok_or_else(|| write_error(part_path, "not a slide of this deck"))?;
                     final_order.push(FinalSlide::Existing(reference));
                 }
-                SlideWrite::Add {
-                    name,
-                    layout_part_path,
-                    shapes,
-                } => {
+                SlideWrite::Add { .. } | SlideWrite::Clone { .. } => {
                     structural = true;
                     let part_path = format!("ppt/slides/slide{next_slide_number}.xml");
                     next_slide_number += 1;
@@ -254,29 +256,102 @@ pub fn write_pptx_with_edits(
                             })?,
                     };
                     minted_slide_id = Some(slide_id);
-                    let layout = layout_part_path
-                        .clone()
-                        .filter(|path| {
-                            package
-                                .layouts
-                                .iter()
-                                .any(|layout| &layout.part_path == path)
-                        })
-                        .or_else(|| {
-                            package
-                                .layouts
-                                .first()
-                                .map(|layout| layout.part_path.clone())
-                        });
-                    if let Some(layout) = &layout {
-                        sink.store(
-                            &slide_relationships_path(&part_path),
-                            slide_relationships_xml(&part_path, layout),
-                        );
+                    match slide {
+                        SlideWrite::Clone {
+                            part_path: source,
+                            shapes,
+                        } => {
+                            let bytes = package
+                                .part_bytes(source)
+                                .ok_or_else(|| PptxError::MissingPart(source.clone()))?;
+                            let mut root = parse_xml(bytes, source, &mut budget)?;
+                            let source_rels = slide_relationships_path(source);
+                            if let Some(bytes) = package.part_bytes(&source_rels) {
+                                let mut rels = parse_xml(bytes, &source_rels, &mut budget)?;
+                                rels.children.retain(|child| match child {
+                                    XmlNode::Element(element) => {
+                                        element.attribute("Type").is_none_or(|kind| {
+                                            !kind.ends_with("/comments")
+                                                && !kind.ends_with("/comment")
+                                        })
+                                    }
+                                    _ => true,
+                                });
+                                sink.store(
+                                    &slide_relationships_path(&part_path),
+                                    serialize_xml(&rels),
+                                );
+                            }
+                            cloned_dependencies.extend(
+                                package
+                                    .relationships
+                                    .get(source)
+                                    .into_iter()
+                                    .flatten()
+                                    .filter(|relationship| {
+                                        !relationship.has_type("/notesSlide")
+                                            && !relationship.has_type("/comments")
+                                            && !relationship.has_type("/comment")
+                                    })
+                                    .filter_map(|relationship| {
+                                        relationship.resolved_target.clone()
+                                    }),
+                            );
+                            cloned_dependencies.extend(clone_notes_part(
+                                &mut sink,
+                                source,
+                                &part_path,
+                                &mut budget,
+                            )?);
+                            let theme = crate::slide_theme(package, Some(source), None);
+                            patch_slide(
+                                &mut root,
+                                shapes,
+                                Some(&theme),
+                                &part_path,
+                                package.shape_elements,
+                                &mut sink,
+                                &mut budget,
+                            )?;
+                            sink.store(&part_path, serialize_xml(&root));
+                        }
+                        SlideWrite::Add {
+                            name,
+                            layout_part_path,
+                            shapes,
+                        } => {
+                            let layout = layout_part_path
+                                .clone()
+                                .filter(|path| {
+                                    package
+                                        .layouts
+                                        .iter()
+                                        .any(|layout| &layout.part_path == path)
+                                })
+                                .or_else(|| {
+                                    package
+                                        .layouts
+                                        .first()
+                                        .map(|layout| layout.part_path.clone())
+                                });
+                            if let Some(layout) = &layout {
+                                sink.store(
+                                    &slide_relationships_path(&part_path),
+                                    slide_relationships_xml(&part_path, layout),
+                                );
+                            }
+                            let xml = slide_xml(
+                                name.as_deref(),
+                                shapes,
+                                &part_path,
+                                &mut sink,
+                                &mut budget,
+                            )?;
+                            sink.store(&part_path, xml);
+                        }
+                        _ => unreachable!(),
                     }
-                    let xml =
-                        slide_xml(name.as_deref(), shapes, &part_path, &mut sink, &mut budget)?;
-                    sink.store(&part_path, xml);
+
                     minted.push(MintedSlide {
                         part_path,
                         relationship_id,
@@ -308,7 +383,7 @@ pub fn write_pptx_with_edits(
         removed_paths.insert(reference.part_path.clone());
         removed_paths.insert(slide_relationships_path(&reference.part_path));
     }
-    let orphans = orphaned_parts(package, &removed);
+    let orphans = orphaned_parts(package, &removed, &cloned_dependencies);
     for orphan in &orphans {
         removed_paths.insert(orphan.clone());
         removed_paths.insert(slide_relationships_path(orphan));
@@ -453,7 +528,11 @@ fn slide_relationships_path(part_path: &str) -> String {
 
 /// Parts that were reachable from the package root only through the removed
 /// slides (notes slides, media used nowhere else, ...), transitively.
-fn orphaned_parts(package: &PptxPackage, removed: &[&SlideReference]) -> Vec<String> {
+fn orphaned_parts(
+    package: &PptxPackage,
+    removed: &[&SlideReference],
+    cloned_dependencies: &[String],
+) -> Vec<String> {
     if removed.is_empty() {
         return Vec::new();
     }
@@ -461,17 +540,26 @@ fn orphaned_parts(package: &PptxPackage, removed: &[&SlideReference]) -> Vec<Str
         .iter()
         .map(|reference| reference.part_path.as_str())
         .collect();
-    let before = reachable_parts(package, &HashSet::new());
-    let after = reachable_parts(package, &excluded);
+    let before = reachable_parts(package, &HashSet::new(), &[]);
+    let after = reachable_parts(package, &excluded, cloned_dependencies);
     before
         .into_iter()
         .filter(|part| !after.contains(part) && !excluded.contains(part.as_str()))
         .collect()
 }
 
-fn reachable_parts(package: &PptxPackage, excluded: &HashSet<&str>) -> HashSet<String> {
-    let mut reachable = HashSet::new();
-    let mut queue = vec![String::new()];
+fn reachable_parts(
+    package: &PptxPackage,
+    excluded: &HashSet<&str>,
+    roots: &[String],
+) -> HashSet<String> {
+    let mut reachable: HashSet<String> = roots
+        .iter()
+        .filter(|part| !excluded.contains(part.as_str()))
+        .cloned()
+        .collect();
+    let mut queue: Vec<String> = reachable.iter().cloned().collect();
+    queue.push(String::new());
     while let Some(source) = queue.pop() {
         for relationship in package.relationships.get(&source).into_iter().flatten() {
             let Some(target) = &relationship.resolved_target else {
@@ -738,6 +826,90 @@ fn patch_comment_parts(
     Ok(())
 }
 
+fn clone_notes_part(
+    sink: &mut PartSink<'_>,
+    source_slide: &str,
+    copy_slide: &str,
+    budget: &mut ParseBudget<'_>,
+) -> Result<Vec<String>, PptxError> {
+    let Some(source_notes) = existing_notes_part(sink.package, source_slide) else {
+        return Ok(Vec::new());
+    };
+    let mut taken = sink
+        .package
+        .parts
+        .iter()
+        .map(|part| part.path.clone())
+        .chain(sink.new_parts.iter().map(|(path, _)| path.clone()))
+        .chain(
+            sink.package
+                .relationships
+                .values()
+                .flatten()
+                .filter_map(|relationship| relationship.resolved_target.clone()),
+        )
+        .collect();
+    let copy_notes = mint_notes_part_path(copy_slide, &mut taken);
+    let bytes = sink
+        .package
+        .part_bytes(&source_notes)
+        .ok_or_else(|| PptxError::MissingPart(source_notes.clone()))?
+        .to_vec();
+    sink.store(&copy_notes, bytes);
+    set_content_type_override(sink, &copy_notes, crate::notes::CT_NOTES_SLIDE, budget)?;
+    set_relationship(
+        sink,
+        &slide_relationships_path(copy_slide),
+        NOTES_SLIDE_RELATIONSHIP_TYPE,
+        &relative_target(copy_slide, &copy_notes),
+        budget,
+    )?;
+    let source_rels = slide_relationships_path(&source_notes);
+    let copy_rels = slide_relationships_path(&copy_notes);
+    let mut dependencies = Vec::new();
+    if let Some(bytes) = sink.package.part_bytes(&source_rels) {
+        let mut root = parse_xml(bytes, &source_rels, budget)?;
+        root.children.retain(|child| match child {
+            XmlNode::Element(element) => element
+                .attribute("Type")
+                .is_none_or(|kind| !kind.ends_with("/comments") && !kind.ends_with("/comment")),
+            _ => true,
+        });
+        for child in &mut root.children {
+            let XmlNode::Element(element) = child else {
+                continue;
+            };
+            if element.local_name() != "Relationship"
+                || element.attribute("TargetMode") == Some("External")
+            {
+                continue;
+            }
+            let target = if element
+                .attribute("Type")
+                .is_some_and(|kind| kind.ends_with("/slide"))
+            {
+                copy_slide.to_owned()
+            } else if let Some(target) = element.attribute("Target") {
+                let target = crate::relationships::resolve_target(&source_notes, target)?;
+                dependencies.push(target.clone());
+                target
+            } else {
+                continue;
+            };
+            element.set_attribute("Target", relative_target(&copy_notes, &target));
+        }
+        sink.store(&copy_rels, serialize_xml(&root));
+    }
+    set_relationship(
+        sink,
+        &copy_rels,
+        SLIDE_RELATIONSHIP_TYPE,
+        &relative_target(&copy_notes, copy_slide),
+        budget,
+    )?;
+    Ok(dependencies)
+}
+
 fn patch_notes_parts(
     package: &PptxPackage,
     write: &NotesWrite,
@@ -751,6 +923,7 @@ fn patch_notes_parts(
         .parts
         .iter()
         .map(|part| part.path.clone())
+        .chain(new_parts.iter().map(|(path, _)| path.clone()))
         .chain(
             package
                 .relationships
@@ -777,7 +950,18 @@ fn patch_notes_parts(
             }
         };
         let relationships_path = slide_relationships_path(&slide_part_path);
-        let existing = existing_notes_part(package, &slide_part_path);
+        let existing = sink
+            .current(&relationships_path)
+            .map(|bytes| {
+                crate::relationships::parse_relationships(
+                    &bytes,
+                    &relationships_path,
+                    &slide_part_path,
+                    budget,
+                )
+            })
+            .transpose()?
+            .and_then(|relationships| crate::notes::slide_notes_part(&relationships));
 
         if text.is_empty() && existing.is_none() {
             continue;
@@ -2066,6 +2250,51 @@ fn set_adjust_values(
 
 // --- text -------------------------------------------------------------------
 
+/// Copies paragraph markup for a source text body.
+pub fn text_paragraph_xml(
+    package: &PptxPackage,
+    part: &str,
+    shape_path: &[usize],
+    target: &TextTarget,
+) -> Result<Vec<String>, PptxError> {
+    let Some(bytes) = package.part_bytes(part) else {
+        return Ok(Vec::new());
+    };
+    let limits = ParseLimits::default();
+    let mut budget = ParseBudget::new(&limits);
+    let mut root = parse_xml(bytes, part, &mut budget)?;
+    let mut element = root
+        .child_mut("cSld")
+        .and_then(|data| data.child_mut("spTree"))
+        .ok_or_else(|| write_error(part, "missing shape tree"))?
+        .clone();
+    for &index in shape_path {
+        let mut slots: Vec<_> = element.children.into_iter().map(Some).collect();
+        let paths = shape_slots(&slots, package.shape_elements);
+        let slot = paths
+            .get(index)
+            .ok_or_else(|| write_error(part, "missing source shape"))?;
+        element = element_at_path(slots[slot.position].as_mut().unwrap(), &slot.path)
+            .ok_or_else(|| write_error(part, "missing source shape"))?
+            .clone();
+    }
+    let body = match target {
+        TextTarget::Body => element.child_mut("txBody"),
+        TextTarget::TableCell { row, cell } => element
+            .child_mut("graphic")
+            .and_then(|graphic| graphic.child_mut("graphicData"))
+            .and_then(|data| data.child_mut("tbl"))
+            .and_then(|table| nth_child_mut(table, "tr", *row))
+            .and_then(|row| nth_child_mut(row, "tc", *cell))
+            .and_then(|cell| cell.child_mut("txBody")),
+    };
+    Ok(body
+        .into_iter()
+        .flat_map(|body| body.children_named("p"))
+        .map(|paragraph| String::from_utf8(serialize_xml_fragment(paragraph)).unwrap())
+        .collect())
+}
+
 fn patch_text(
     element: &mut XmlElement,
     text: &TextWrite,
@@ -2084,7 +2313,7 @@ fn patch_text(
             .and_then(|table_cell| table_cell.child_mut("txBody")),
     };
     let body = body.ok_or_else(|| write_error(part, "text target has no body"))?;
-    rebuild_paragraphs(body, &text.paragraphs, theme, prefixes);
+    rebuild_paragraphs(body, &text.paragraphs, theme, prefixes)?;
     Ok(())
 }
 
@@ -2108,23 +2337,29 @@ fn rebuild_paragraphs(
     paragraphs: &[ParagraphWrite],
     theme: Option<&Theme>,
     prefixes: &Prefixes,
-) {
+) -> Result<(), PptxError> {
     let mut preamble = Vec::new();
-    let mut originals: Vec<Option<XmlElement>> = Vec::new();
+    let mut originals: Vec<XmlElement> = Vec::new();
     for child in std::mem::take(&mut body.children) {
         match child {
             XmlNode::Element(element) if element.local_name() == "p" => {
-                originals.push(Some(element));
+                originals.push(element);
             }
             XmlNode::Text(text) if text.trim().is_empty() => {}
             other => preamble.push(other),
         }
     }
     let mut children = preamble;
+    let limits = ParseLimits::default();
+    let mut budget = ParseBudget::new(&limits);
     for paragraph in paragraphs {
-        let source = paragraph
-            .source_index
-            .and_then(|index| originals.get_mut(index).and_then(Option::take));
+        let source = if let Some(xml) = &paragraph.preserved_xml {
+            Some(parse_xml(xml.as_bytes(), "paragraph", &mut budget)?)
+        } else {
+            paragraph
+                .source_index
+                .and_then(|index| originals.get(index).cloned())
+        };
         let element = match source {
             Some(element) if !paragraph.rebuild => element,
             source => build_paragraph(paragraph, source, theme, prefixes),
@@ -2138,6 +2373,7 @@ fn rebuild_paragraphs(
         children.push(XmlNode::Element(XmlElement::new(prefixes.drawing("p"))));
     }
     body.children = children;
+    Ok(())
 }
 
 fn is_run_element(local: &str) -> bool {
@@ -2196,6 +2432,7 @@ fn segment_matches(element: &XmlElement, segment: &RunSegment<'_>, theme: Option
         && source.italic == target.italic
         && source.font_size_pt == target.font_size_pt
         && source.spacing_pt == target.spacing_pt
+        && source.kern_pt == target.kern_pt
         && source.underline == target.underline
         && source.caps == target.caps
         && source.font_family == target.font_family
@@ -2332,11 +2569,17 @@ fn span_elements(
             let range = &ranges[range_index];
             let source = &source_runs[range.source];
             if segment.line_break {
+                let template = if source.local_name() == "br"
+                    || source
+                        .child("rPr")
+                        .is_some_and(|properties| properties.child("gradFill").is_some())
+                {
+                    source.child("rPr")
+                } else {
+                    None
+                };
                 output.push(XmlNode::Element(segment_element(
-                    segment,
-                    source.child("rPr"),
-                    theme,
-                    prefixes,
+                    segment, template, theme, prefixes,
                 )));
                 offset += 1;
                 break;
@@ -2633,7 +2876,7 @@ fn segment_properties(
     theme: Option<&Theme>,
     prefixes: &Prefixes,
 ) -> Option<XmlElement> {
-    match template.filter(|template| !segment.line_break || template.child("gradFill").is_some()) {
+    match template {
         Some(template) => {
             let mut base = template.clone();
             apply_run_properties(&mut base, segment.properties, theme, prefixes);
@@ -2696,6 +2939,32 @@ const POST_LATIN_ELEMENTS: [&str; 7] = [
     "extLst",
 ];
 
+fn is_flattened_colour_snapshot(
+    authored: Option<&ColorValue>,
+    requested: Option<&ColorValue>,
+    theme: Option<&Theme>,
+) -> bool {
+    let (Some(authored), Some(requested)) = (authored, requested) else {
+        return false;
+    };
+    if requested.theme_color.is_some()
+        || requested.theme_tint.is_some()
+        || requested.theme_shade.is_some()
+        || requested.auto.is_some()
+        || requested.luminance_modulation.is_some()
+        || requested.luminance_offset.is_some()
+        || requested.saturation_modulation.is_some()
+    {
+        return false;
+    }
+    if requested.alpha.is_some() && requested.alpha != authored.alpha {
+        return false;
+    }
+    resolve_color_value_to_hex_with_theme(Some(authored), theme)
+        .zip(requested.rgb.as_deref())
+        .is_some_and(|(hex, rgb)| rgb.eq_ignore_ascii_case(&hex[1..]))
+}
+
 /// Updates modeled styling while preserving unmodeled XML.
 fn apply_run_properties(
     base: &mut XmlElement,
@@ -2713,6 +2982,12 @@ fn apply_run_properties(
         Some(spacing) => base.set_attribute("spc", format_fixed(spacing * 100.0)),
         None => {
             base.attributes.remove("spc");
+        }
+    }
+    match properties.kern_pt {
+        Some(kern) => base.set_attribute("kern", format_fixed(kern * 100.0)),
+        None => {
+            base.attributes.remove("kern");
         }
     }
     match properties.baseline_pct {
@@ -2742,22 +3017,12 @@ fn apply_run_properties(
             base.attributes.remove("u");
         }
     }
-    let keeps_gradient = properties.color.as_ref().is_some_and(|color| {
-        base.child("gradFill")
-            .and_then(crate::drawing::run_gradient_color)
-            .is_some_and(|authored| {
-                &authored == color
-                    || resolve_color_value_to_hex_with_theme(Some(&authored), theme).is_some_and(
-                        |authored| {
-                            Some(authored)
-                                == resolve_color_value_to_hex_with_theme(Some(color), theme)
-                        },
-                    )
-            })
-    });
+    let authored = parse_run_properties(Some(base)).color;
+    let keeps_fill = authored == properties.color
+        || is_flattened_colour_snapshot(authored.as_ref(), properties.color.as_ref(), theme);
     // A colour write replaces the whole fill choice; clearing the colour only
     // drops an explicit solidFill so an unmodeled noFill/gradFill survives.
-    let removed_fills: &[&str] = if keeps_gradient {
+    let removed_fills: &[&str] = if keeps_fill {
         &[]
     } else if properties.color.is_some() {
         &FILL_ELEMENTS
@@ -2773,7 +3038,7 @@ fn apply_run_properties(
     if let Some(color) = properties
         .color
         .as_ref()
-        .filter(|_| !keeps_gradient)
+        .filter(|_| !keeps_fill)
         .and_then(|color| color_element(color, prefixes))
     {
         let position = base
@@ -2788,13 +3053,24 @@ fn apply_run_properties(
             XmlNode::Element(XmlElement::new(prefixes.drawing("solidFill")).with_child(color)),
         );
     }
-    base.children.retain(|child| {
-        !matches!(
-            child,
-            XmlNode::Element(element) if element.local_name() == "latin"
-        )
-    });
-    if let Some(family) = &properties.font_family {
+    let Some(family) = &properties.font_family else {
+        base.children.retain(|child| {
+            !matches!(
+                child,
+                XmlNode::Element(element) if element.local_name() == "latin"
+            )
+        });
+        return;
+    };
+    if let Some(latin) = base.child_mut("latin") {
+        if latin.attribute("typeface") != Some(family.as_str()) {
+            // panose, pitchFamily and charset describe the old face.
+            latin
+                .attributes
+                .retain(|name, _| name == "xmlns" || name.starts_with("xmlns:"));
+            latin.set_attribute("typeface", family.clone());
+        }
+    } else {
         let position = base
             .children
             .iter()
@@ -2900,6 +3176,10 @@ fn run_properties_element(properties: &RunProperties, prefixes: &Prefixes) -> Op
     }
     if let Some(spacing) = properties.spacing_pt {
         element.set_attribute("spc", format_fixed(spacing * 100.0));
+        present = true;
+    }
+    if let Some(kern) = properties.kern_pt {
+        element.set_attribute("kern", format_fixed(kern * 100.0));
         present = true;
     }
     if let Some(baseline) = properties.baseline_pct {
@@ -3498,6 +3778,20 @@ mod tests {
     }
 
     #[test]
+    fn a_lowercase_flattened_colour_keeps_the_gradient() {
+        let (mut element, prefixes, mut properties) = run_properties(
+            br#"<a:rPr xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" lang="en"><a:gradFill><a:gsLst><a:gs pos="0"><a:srgbClr val="FF0000"/></a:gs><a:gs pos="100000"><a:srgbClr val="0000FF"/></a:gs></a:gsLst></a:gradFill></a:rPr>"#,
+        );
+        properties.color = Some(ColorValue {
+            rgb: Some("ff0000".to_owned()),
+            ..ColorValue::default()
+        });
+        let gradient = element.child("gradFill").unwrap().clone();
+        apply_run_properties(&mut element, &properties, None, &prefixes);
+        assert_eq!(element.child("gradFill"), Some(&gradient));
+    }
+
+    #[test]
     fn an_edited_colour_replaces_the_gradient() {
         let (mut element, prefixes, mut properties) = run_properties(
             br#"<a:rPr xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" lang="en"><a:gradFill><a:gsLst><a:gs pos="0"><a:srgbClr val="FFFFFF"/></a:gs></a:gsLst></a:gradFill></a:rPr>"#,
@@ -3549,6 +3843,7 @@ mod tests {
         let prefixes = Prefixes::from_root(&mut root);
         let write = ParagraphWrite {
             source_index: Some(0),
+            preserved_xml: None,
             rebuild: true,
             properties_changed: false,
             alignment: None,
@@ -3599,6 +3894,197 @@ mod tests {
             ),
             "{xml}"
         );
+    }
+
+    const FONT_PARAGRAPH: &str = r#"<a:p xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:pPr algn="ctr"/><a:r><a:rPr lang="en-US"><a:highlight><a:srgbClr val="FFFF00"/></a:highlight><a:latin charset="0" panose="020B0604020202020204" pitchFamily="34" typeface="Arial" vendorHint="1"/><a:cs charset="0" panose="020B0604020202020204" pitchFamily="34" typeface="Arial"/></a:rPr><a:t>38.8%</a:t></a:r><a:r><a:rPr b="1" lang="en-US"><a:latin charset="0" panose="020B0604020202020204" pitchFamily="34" typeface="Arial"/></a:rPr><a:t> of cases</a:t></a:r></a:p>"#;
+    const ARIAL_LATIN: &str = r#"<a:latin charset="0" panose="020B0604020202020204" pitchFamily="34" typeface="Arial" vendorHint="1"/>"#;
+
+    fn font_runs(family: &str) -> [(&'static str, RunProperties); 2] {
+        let arial = RunProperties {
+            font_family: Some("Arial".to_owned()),
+            ..RunProperties::default()
+        };
+        [
+            (
+                "39.8%",
+                RunProperties {
+                    font_family: Some(family.to_owned()),
+                    ..RunProperties::default()
+                },
+            ),
+            (
+                " of cases",
+                RunProperties {
+                    bold: Some(true),
+                    ..arial
+                },
+            ),
+        ]
+    }
+
+    fn edited_font_body(latin: &str) -> String {
+        let (_, body) = FONT_PARAGRAPH.split_once('>').unwrap();
+        let edited = body.replace("38.8%", "39.8%");
+        edited.replacen(ARIAL_LATIN, latin, 1)
+    }
+
+    #[test]
+    fn a_text_edit_keeps_the_latin_font_element_whole() {
+        let xml = rebuilt_paragraph(FONT_PARAGRAPH.as_bytes(), &font_runs("Arial"));
+        assert!(xml.ends_with(&edited_font_body(ARIAL_LATIN)), "{xml}");
+    }
+
+    #[test]
+    fn a_new_font_family_drops_the_old_face_metrics_in_place() {
+        let xml = rebuilt_paragraph(FONT_PARAGRAPH.as_bytes(), &font_runs("Calibri"));
+        let calibri = edited_font_body(r#"<a:latin typeface="Calibri"/>"#);
+        assert!(xml.ends_with(&calibri), "{xml}");
+    }
+
+    const FILL_PARAGRAPH: &str = r#"<a:p xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:r><a:rPr lang="en-US"><a:solidFill><a:schemeClr val="accent6"><a:lumMod val="75000"/></a:schemeClr></a:solidFill></a:rPr><a:t>amongst</a:t></a:r><a:r><a:rPr lang="en-US"><a:solidFill><a:schemeClr val="tx1"/></a:solidFill></a:rPr><a:t> them</a:t></a:r></a:p>"#;
+
+    /// Each run's colour flattened to hex, as the editor snapshot hands it back.
+    fn hex_runs() -> Vec<(&'static str, RunProperties)> {
+        let limits = ParseLimits::default();
+        let mut budget = ParseBudget::new(&limits);
+        let path = "ppt/slides/slide1.xml";
+        let root = parse_xml(FILL_PARAGRAPH.as_bytes(), path, &mut budget).unwrap();
+        root.child_elements()
+            .zip(["among", " then"])
+            .map(|(run, text)| {
+                let color = parse_run_properties(run.child("rPr")).color;
+                let hex = resolve_color_value_to_hex_with_theme(color.as_ref(), None);
+                let color = ColorValue {
+                    rgb: hex.map(|hex| hex[1..].to_owned()),
+                    ..ColorValue::default()
+                };
+                let properties = RunProperties {
+                    color: Some(color),
+                    ..RunProperties::default()
+                };
+                (text, properties)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_text_edit_keeps_theme_colours_and_their_transforms() {
+        let xml = rebuilt_paragraph(FILL_PARAGRAPH.as_bytes(), &hex_runs());
+        let (_, body) = FILL_PARAGRAPH.split_once('>').unwrap();
+        let edited = body.replace("amongst", "among").replace(" them", " then");
+        assert!(xml.ends_with(&edited), "{xml}");
+    }
+
+    #[test]
+    fn an_explicit_colour_edit_replaces_the_theme_fill() {
+        let mut runs = hex_runs();
+        runs[0].1.color = Some(ColorValue {
+            rgb: Some("FF0000".to_owned()),
+            ..ColorValue::default()
+        });
+        let xml = rebuilt_paragraph(FILL_PARAGRAPH.as_bytes(), &runs);
+        let red = r#"<a:rPr lang="en-US"><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></a:rPr><a:t>among</a:t>"#;
+        assert!(xml.contains(red), "{xml}");
+        assert!(xml.contains(r#"<a:schemeClr val="tx1"/>"#), "{xml}");
+    }
+
+    #[test]
+    fn an_alpha_change_on_an_unchanged_theme_colour_is_written() {
+        let xml = rebuilt_paragraph(
+            br#"<a:p xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:r><a:rPr lang="en-US"><a:solidFill><a:schemeClr val="tx1"><a:alpha val="50000"/></a:schemeClr></a:solidFill></a:rPr><a:t>amongst</a:t></a:r></a:p>"#,
+            &[(
+                "among",
+                RunProperties {
+                    color: Some(ColorValue {
+                        theme_color: Some("text1".to_owned()),
+                        alpha: Some(1.0),
+                        ..ColorValue::default()
+                    }),
+                    ..RunProperties::default()
+                },
+            )],
+        );
+        assert!(
+            xml.contains(r#"<a:schemeClr val="tx1"><a:alpha val="100000"/></a:schemeClr>"#),
+            "{xml}"
+        );
+        assert!(!xml.contains(r#"val="50000""#), "{xml}");
+    }
+
+    #[test]
+    fn switching_theme_slots_with_the_same_rgb_writes_the_new_slot() {
+        let xml = rebuilt_paragraph(
+            br#"<a:p xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:r><a:rPr lang="en-US"><a:solidFill><a:schemeClr val="tx1"/></a:solidFill></a:rPr><a:t>amongst</a:t></a:r></a:p>"#,
+            &[(
+                "among",
+                RunProperties {
+                    color: Some(ColorValue {
+                        theme_color: Some("dk1".to_owned()),
+                        ..ColorValue::default()
+                    }),
+                    ..RunProperties::default()
+                },
+            )],
+        );
+        assert!(xml.contains(r#"<a:schemeClr val="dk1"/>"#), "{xml}");
+        assert!(!xml.contains(r#"<a:schemeClr val="tx1"/>"#), "{xml}");
+    }
+
+    #[test]
+    fn an_unchanged_transformed_theme_colour_survives_byte_identical() {
+        let xml = rebuilt_paragraph(
+            br#"<a:p xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:r><a:rPr lang="en-US"><a:solidFill><a:schemeClr val="accent1"><a:lumMod val="60000"/><a:lumOff val="40000"/></a:schemeClr></a:solidFill></a:rPr><a:t>amongst</a:t></a:r></a:p>"#,
+            &[(
+                "among",
+                RunProperties {
+                    color: Some(ColorValue {
+                        rgb: Some("8FAADC".to_owned()),
+                        ..ColorValue::default()
+                    }),
+                    ..RunProperties::default()
+                },
+            )],
+        );
+        assert!(
+            xml.contains(
+                r#"<a:solidFill><a:schemeClr val="accent1"><a:lumMod val="60000"/><a:lumOff val="40000"/></a:schemeClr></a:solidFill>"#
+            ),
+            "{xml}"
+        );
+        assert!(!xml.contains("8FAADC"), "{xml}");
+    }
+
+    #[test]
+    fn an_edit_spanning_a_styled_line_break_keeps_the_break_properties() {
+        let xml = rebuilt_paragraph(
+            br#"<a:p xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:r><a:rPr lang="en-US"/><a:t>First line</a:t></a:r><a:br><a:rPr lang="en-US"><a:solidFill><a:schemeClr val="accent1"><a:lumMod val="60000"/><a:lumOff val="40000"/></a:schemeClr></a:solidFill><a:latin charset="0" panose="020B0604020202020204" pitchFamily="34" typeface="Arial"/><a:ea typeface="MS Gothic"/><a:cs typeface="Arial"/></a:rPr></a:br><a:r><a:rPr lang="en-US"/><a:t>Second line</a:t></a:r></a:p>"#,
+            &[(
+                "First line changed\nSecond line changed",
+                RunProperties {
+                    color: Some(ColorValue {
+                        rgb: Some("8FAADC".to_owned()),
+                        ..ColorValue::default()
+                    }),
+                    font_family: Some("Arial".to_owned()),
+                    ..RunProperties::default()
+                },
+            )],
+        );
+        assert!(
+            xml.contains(
+                r#"<a:br><a:rPr lang="en-US"><a:solidFill><a:schemeClr val="accent1"><a:lumMod val="60000"/><a:lumOff val="40000"/></a:schemeClr></a:solidFill><a:latin charset="0" panose="020B0604020202020204" pitchFamily="34" typeface="Arial"/><a:ea typeface="MS Gothic"/><a:cs typeface="Arial"/></a:rPr></a:br>"#
+            ),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn an_inserted_line_break_does_not_inherit_a_neighbouring_run_properties() {
+        let xml = rebuilt_paragraph(
+            br#"<a:p xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><a:r><a:rPr lang="en-US" strike="sngStrike"><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill><a:hlinkClick r:id="rId2"/></a:rPr><a:t>HelloWorld</a:t></a:r></a:p>"#,
+            &[("Hello\nWorld", RunProperties::default())],
+        );
+        assert!(xml.contains("<a:br/>"), "{xml}");
     }
 
     #[test]

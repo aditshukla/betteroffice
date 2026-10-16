@@ -5,8 +5,8 @@ use serde::Serialize;
 use yrs::{Map, TextRef, Transact};
 
 use crate::deck::{
-    live_shape_order, map_string_array, required_map, required_order, shape_ref, slide_ref,
-    slide_shape_order, string_array_ref,
+    live_shape_order, live_slide_ids, map_string_array, required_map, shape_ref, slide_ref,
+    slide_shape_order,
 };
 use crate::{DeckSession, EditError, EditResult, STORIES, story::snapshot_story};
 
@@ -24,13 +24,13 @@ pub struct TextSearchMatch {
 }
 
 /// Literal query with Unicode simple case-insensitive matching.
-struct Needle {
+pub(crate) struct Needle {
     folded: String,
     case_sensitive: bool,
 }
 
 impl Needle {
-    fn new(query: &str, case_sensitive: bool) -> Self {
+    pub(crate) fn new(query: &str, case_sensitive: bool) -> Self {
         let folded = if case_sensitive {
             query.to_owned()
         } else {
@@ -44,6 +44,15 @@ impl Needle {
 
     /// Lazily yields the non-overlapping byte ranges of `text` equal to the query, in order.
     fn find_all<'a>(&'a self, text: &'a str) -> Matches<'a> {
+        self.matches(text, false)
+    }
+
+    /// Like [`Needle::find_all`], but every occurrence counts, overlapping ones included.
+    pub(crate) fn find_overlapping<'a>(&'a self, text: &'a str) -> Matches<'a> {
+        self.matches(text, true)
+    }
+
+    fn matches<'a>(&'a self, text: &'a str, overlapping: bool) -> Matches<'a> {
         let (haystack, origins) = if self.case_sensitive {
             (Cow::Borrowed(text), Vec::new())
         } else {
@@ -61,6 +70,7 @@ impl Needle {
             haystack,
             origins,
             cursor: 0,
+            overlapping,
         }
     }
 }
@@ -88,11 +98,13 @@ fn fold_char(ch: char) -> char {
 }
 
 /// Byte ranges in the original text; empty `origins` means the haystack is that text.
-struct Matches<'a> {
+pub(crate) struct Matches<'a> {
     needle: &'a str,
     haystack: Cow<'a, str>,
     origins: Vec<(usize, usize)>,
     cursor: usize,
+    /// Resume one character after a match's start rather than at its end.
+    overlapping: bool,
 }
 
 impl Iterator for Matches<'_> {
@@ -104,7 +116,15 @@ impl Iterator for Matches<'_> {
         }
         let start = self.cursor + self.haystack[self.cursor..].find(self.needle)?;
         let end = start + self.needle.len();
-        self.cursor = end;
+        self.cursor = if self.overlapping {
+            start
+                + self.haystack[start..]
+                    .chars()
+                    .next()
+                    .map_or(1, char::len_utf8)
+        } else {
+            end
+        };
         Some((self.original(start), self.original(end)))
     }
 }
@@ -136,13 +156,8 @@ impl DeckSession {
         let needle = Needle::new(query, case_sensitive);
         let txn = self.doc.transact();
         let stories = required_map(&txn, STORIES)?;
-        let mut seen_slides = HashSet::new();
         let mut matches = Vec::new();
-        for (slide_index, slide_id) in string_array_ref(&required_order(&txn)?, &txn)
-            .into_iter()
-            .filter(|id| seen_slides.insert(id.clone()))
-            .enumerate()
-        {
+        for (slide_index, slide_id) in live_slide_ids(&txn)?.into_iter().enumerate() {
             let slide = slide_ref(&txn, &slide_id)?;
             let mut shapes = live_shape_order(&slide_shape_order(&slide, &txn)?, &txn)?;
             shapes.reverse();
@@ -292,5 +307,20 @@ mod tests {
         assert_eq!(ranges("ss", false), [(15, 17)]);
         assert_eq!(ranges("aa", false), [(26, 28)]);
         assert_eq!(Needle::new("", false).find_all(text).next(), None);
+    }
+
+    #[test]
+    fn overlapping_matches_count_every_occurrence() {
+        let needle = Needle::new("aa", true);
+        assert_eq!(needle.find_all("aaa").collect::<Vec<_>>(), [(0, 2)]);
+        assert_eq!(
+            needle.find_overlapping("aaa").collect::<Vec<_>>(),
+            [(0, 2), (1, 3)]
+        );
+        let emoji = Needle::new("😀😀", true);
+        assert_eq!(
+            emoji.find_overlapping("😀😀😀").collect::<Vec<_>>(),
+            [(0, 8), (4, 12)]
+        );
     }
 }

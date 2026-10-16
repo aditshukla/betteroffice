@@ -32,7 +32,7 @@ fn table_lookup(args: &[Expr], ctx: &EvalContext<'_>, vertical: bool) -> CellVal
         return err(value);
     }
     let area = match crate::eval::required_area(&args[1], ctx) {
-        Ok(a) => crate::eval::bound_area(a, ctx),
+        Ok(a) => a,
         Err(error) => return err(error),
     };
     let index = match nth_int(args, ctx, 2) {
@@ -50,10 +50,13 @@ fn table_lookup(args: &[Expr], ctx: &EvalContext<'_>, vertical: bool) -> CellVal
     } else {
         true
     };
+    // the search stops where the sheet's data does, but the index may still
+    // reach past it into blanks
+    let searched = crate::eval::bound_area(area, ctx);
     let (lines, depth) = if vertical {
-        (area.rows, area.cols)
+        (searched.rows, area.cols)
     } else {
-        (area.cols, area.rows)
+        (searched.cols, area.rows)
     };
     if index as usize > depth {
         return err(ErrorValue::Ref);
@@ -67,20 +70,26 @@ fn table_lookup(args: &[Expr], ctx: &EvalContext<'_>, vertical: bool) -> CellVal
     };
     let mut found = None;
     if approximate {
-        // excel binary-searches an approximate lookup, so a header or any
-        // other out-of-order row above the data does not end the search
         let (mut lo, mut hi) = (0usize, lines);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let key = match key(mid) {
-                Ok(key) => key,
-                Err(error) => return err(error),
-            };
-            if cmp_values(key.as_ref(), &target) == Ordering::Greater {
-                hi = mid;
-            } else {
-                found = Some(mid);
-                lo = mid + 1;
+            let mut pivot = None;
+            for i in mid..hi {
+                let key = match key(i) {
+                    Ok(key) => key,
+                    Err(error) => return err(error),
+                };
+                if comparable(key.as_ref(), &target) {
+                    pivot = Some((i, cmp_values(key.as_ref(), &target)));
+                    break;
+                }
+            }
+            match pivot {
+                Some((i, ordering)) if ordering != Ordering::Greater => {
+                    found = Some(i);
+                    lo = i + 1;
+                }
+                _ => hi = mid,
             }
         }
     } else {
@@ -143,6 +152,9 @@ pub(crate) fn match_(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
         _ => {
             let mut found = None;
             for (i, v) in values.iter().enumerate() {
+                if !comparable(v.as_ref(), &target) {
+                    continue;
+                }
                 if cmp_values(v.as_ref(), &target) != Ordering::Less {
                     found = Some(i);
                 } else {
@@ -222,6 +234,9 @@ pub(crate) fn xmatch(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
     };
     let mut best: Option<usize> = None;
     for &i in &order {
+        if mode != 0 && !comparable(values[i].as_ref(), &target) {
+            continue;
+        }
         let ordering = cmp_values(values[i].as_ref(), &target);
         if ordering == Ordering::Equal {
             return num(i as f64 + 1.0);
@@ -372,8 +387,10 @@ pub(crate) fn indirect_area(args: &[Expr], ctx: &EvalContext<'_>) -> Result<Area
         return Err(ErrorValue::Value);
     }
     if let Some(style) = args.get(1) {
-        // a bad a1 argument is the caller's error, not a silent A1 default
+        // a bad a1 argument is the caller's error, not a silent A1 default;
+        // R1C1 text is an engine gap
         if !crate::eval::to_bool(&evaluate(style, ctx))? {
+            ctx.record_unsupported_function();
             return Err(ErrorValue::Ref);
         }
     }
@@ -382,11 +399,23 @@ pub(crate) fn indirect_area(args: &[Expr], ctx: &EvalContext<'_>) -> Result<Area
         CellValue::Error { value } => return Err(value),
         _ => return Err(ErrorValue::Ref),
     };
-    let expr = crate::parse_formula(&text).map_err(|_| ErrorValue::Ref)?;
+    let expr = crate::parse_formula(&text).map_err(|_| {
+        if text.contains('[') {
+            ctx.record_unsupported_function();
+        }
+        ErrorValue::Ref
+    })?;
     if !matches!(
         expr,
         Expr::Ref { .. } | Expr::Range { .. } | Expr::ColumnRange { .. } | Expr::RowRange { .. }
     ) {
+        if let Expr::Name {
+            scope: Some(scope), ..
+        } = &expr
+            && scope.contains('[')
+        {
+            ctx.record_unsupported_function();
+        }
         return Err(ErrorValue::Ref);
     }
     as_area(&expr, ctx).ok_or(ErrorValue::Ref)
@@ -485,12 +514,13 @@ fn flatten_vector(block: &crate::array::Array) -> Vec<CellValue> {
         .collect()
 }
 
-/// LOOKUP only compares entries of the target's own kind.
-fn comparable(value: &CellValue, target: &CellValue) -> bool {
+pub(crate) fn comparable(value: &CellValue, target: &CellValue) -> bool {
     matches!(
         (value, target),
-        (CellValue::Number { .. }, CellValue::Number { .. })
-            | (CellValue::Text { .. }, CellValue::Text { .. })
+        (
+            CellValue::Number { .. },
+            CellValue::Number { .. } | CellValue::Empty
+        ) | (CellValue::Text { .. }, CellValue::Text { .. })
             | (CellValue::Bool { .. }, CellValue::Bool { .. })
     )
 }
@@ -603,7 +633,11 @@ fn approximate_row<'v>(
 ) -> Option<usize> {
     let mut found = None;
     for i in 0..len {
-        if cmp_values(key(i).as_ref(), target) != Ordering::Greater {
+        let value = key(i);
+        if !comparable(value.as_ref(), target) {
+            continue;
+        }
+        if cmp_values(value.as_ref(), target) != Ordering::Greater {
             found = Some(i);
         } else {
             break;
@@ -726,8 +760,8 @@ pub(crate) fn address(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
         )
     };
     match sheet {
-        Some(name) => crate::eval::text(format!("{}!{}", quoted_sheet(&name), body)),
-        None => crate::eval::text(body),
+        Some(name) => crate::eval::text(ctx, format!("{}!{}", quoted_sheet(&name), body)),
+        None => crate::eval::text(ctx, body),
     }
 }
 
@@ -773,7 +807,7 @@ pub(crate) fn hyperlink(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
     };
     match shown {
         CellValue::Error { value } => err(value),
-        CellValue::Empty => crate::eval::text(""),
+        CellValue::Empty => crate::eval::text(ctx, ""),
         value => value,
     }
 }

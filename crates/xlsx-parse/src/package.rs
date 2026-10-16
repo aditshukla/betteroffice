@@ -1,13 +1,16 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use quick_xml::events::{BytesEnd, BytesStart, Event};
 use quick_xml::name::ResolveResult;
 use quick_xml::{NsReader, Reader, Writer};
-use xlsx_model::{SheetId, Workbook};
+use xlsx_model::{CellRef, SheetId, Workbook};
 
-use crate::read::SharedStringCells;
+use crate::read::{SharedStringCells, SourceCellFacts};
 use crate::reference::UnpatchableReference;
-use crate::xml::{attr, find_part, local_name, next_event, reader, resolve_part_path, xml_err};
+use crate::xml::{
+    attr, collect_text, find_part, local_name, next_event, reader, resolve_part_path, utf8_bom_len,
+    xml_err,
+};
 use crate::{MAX_DEPTH, ParseError};
 
 /// Source package data retained for ownership-aware writes.
@@ -31,6 +34,7 @@ pub struct PreservedPackage {
     pub(crate) original_workbook: Workbook,
     pub(crate) active_sheet: SheetId,
     pub(crate) unpatchable_references: Vec<UnpatchableReference>,
+    pub(crate) rich_shared_strings: BTreeSet<usize>,
 }
 
 impl PreservedPackage {
@@ -42,7 +46,10 @@ impl PreservedPackage {
         active_sheet: SheetId,
         shared_string_cells: &[SharedStringCells],
         declined_parts: &[String],
+        rich_shared_strings: BTreeSet<usize>,
+        cell_facts: Vec<SourceCellFacts>,
     ) -> Result<Self, ParseError> {
+        let mut cell_facts = cell_facts.into_iter();
         let workbook_xml = find_part(&parts, "xl/workbook.xml")
             .ok_or_else(|| ParseError::MissingPart("xl/workbook.xml".into()))?;
         let workbook_template = XmlTemplate::capture(workbook_xml)?;
@@ -64,10 +71,7 @@ impl PreservedPackage {
             .map(parse_relationships)
             .transpose()?
             .unwrap_or_default();
-        let relationship_by_id = workbook_relationships
-            .iter()
-            .filter_map(|relationship| relationship.id().map(|id| (id.to_owned(), relationship)))
-            .collect::<HashMap<_, _>>();
+        let relationship_by_id = relationships_by_id(&workbook_relationships);
 
         let sheet_entries = parse_sheet_entries(workbook_xml)?;
         let mut sheets = Vec::with_capacity(sheet_entries.len());
@@ -93,6 +97,7 @@ impl PreservedPackage {
                 attributes: entry.attributes,
                 template: XmlTemplate::capture(bytes)?,
                 shared_string_cells: shared_string_cells.get(index).cloned().unwrap_or_default(),
+                cell_facts: cell_facts.next().unwrap_or_default(),
             });
         }
 
@@ -114,6 +119,11 @@ impl PreservedPackage {
             .and_then(|part| find_part(&parts, &part.path))
             .map(XmlTemplate::capture)
             .transpose()?;
+        // a part a sheet resolves to is never a calc chain an edited save drops
+        let sheet_paths = sheets
+            .iter()
+            .map(|sheet| normalized_part_name(&sheet.path))
+            .collect::<HashSet<_>>();
         let mut calc_chains = workbook_relationships
             .iter()
             .filter(|relationship| relationship.has_type("calcChain"))
@@ -130,6 +140,7 @@ impl PreservedPackage {
                 relationship_id: None,
             });
         }
+        calc_chains.retain(|chain| !sheet_paths.contains(&normalized_part_name(&chain.path)));
         let stylesheet_template = styles
             .as_ref()
             .and_then(|part| find_part(&parts, &part.path))
@@ -175,12 +186,28 @@ impl PreservedPackage {
             original_workbook: workbook.clone(),
             active_sheet,
             unpatchable_references,
+            rich_shared_strings,
         })
     }
 
     /// Returns retained bytes for a package part.
     pub fn part_bytes(&self, path: &str) -> Option<&[u8]> {
         find_part(&self.parts, path)
+    }
+
+    #[doc(hidden)]
+    pub fn legacy_style_readings(&self) -> Result<crate::LegacyStyleReadings, ParseError> {
+        let parsed = crate::read::parse_workbook_indexed(&self.parts)?;
+        let styles = crate::read::legacy_style_readings(
+            &self.parts,
+            &parsed.workbook,
+            parsed.legacy_styles.as_ref(),
+        )?;
+        Ok(crate::LegacyStyleReadings {
+            workbook: parsed.workbook,
+            dimensions: parsed.legacy_dimensions,
+            styles,
+        })
     }
 
     #[doc(hidden)]
@@ -223,6 +250,105 @@ impl PreservedPackage {
         self.stranded(|reference| reference.moved_by_cols(sheet, at))
     }
 
+    /// A worksheet part whose preserved features cannot follow a cell move.
+    #[doc(hidden)]
+    pub fn range_move_unsupported_part(
+        &self,
+        cell_moved: impl Fn(usize, CellRef) -> bool,
+        comment_affected: impl Fn(usize, CellRef) -> bool,
+        formula_affected: impl Fn(usize, &str) -> bool,
+    ) -> Option<&str> {
+        for (index, sheet) in self.sheets.iter().enumerate() {
+            if sheet
+                .cell_facts
+                .rich_inline
+                .keys()
+                .any(|&(row, col)| cell_moved(index, CellRef::new(row, col)))
+                || sheet
+                    .shared_string_cells
+                    .iter()
+                    .any(|(&(row, col), entry)| {
+                        self.shared_string_is_rich(*entry)
+                            && cell_moved(index, CellRef::new(row, col))
+                    })
+            {
+                return Some(&sheet.path);
+            }
+            let Some(bytes) = find_part(&self.parts, &sheet.path) else {
+                return Some(&sheet.path);
+            };
+            let mut xml = Reader::from_reader(bytes);
+            let mut buffer = Vec::new();
+            loop {
+                match xml.read_event_into(&mut buffer) {
+                    Ok(Event::Start(start) | Event::Empty(start)) => {
+                        let name = local_name(&start);
+                        if matches!(
+                            name.as_slice(),
+                            b"conditionalFormatting"
+                                | b"dataValidations"
+                                | b"sheetProtection"
+                                | b"protectedRanges"
+                                | b"autoFilter"
+                                | b"sortState"
+                                | b"drawing"
+                                | b"legacyDrawing"
+                                | b"picture"
+                                | b"extLst"
+                                | b"pivotTableParts"
+                                | b"controls"
+                                | b"oleObjects"
+                        ) {
+                            return Some(&sheet.path);
+                        }
+                    }
+                    Ok(Event::Eof) => break,
+                    Err(_) => return Some(&sheet.path),
+                    _ => {}
+                }
+                buffer.clear();
+            }
+            let relationships = match find_part(&self.parts, &relationship_part_path(&sheet.path)) {
+                Some(bytes) => match parse_relationships(bytes) {
+                    Ok(relationships) => relationships,
+                    Err(_) => return Some(&sheet.path),
+                },
+                None => continue,
+            };
+            for relationship in relationships {
+                let table = relationship.has_type("table");
+                let comments =
+                    relationship.has_type("comments") || relationship.has_type("threadedComment");
+                if !table && !comments {
+                    continue;
+                }
+                let Some(target) = relationship.target() else {
+                    return Some(&sheet.path);
+                };
+                if relationship
+                    .attribute("TargetMode")
+                    .is_some_and(|mode| mode.eq_ignore_ascii_case("external"))
+                {
+                    return Some(&sheet.path);
+                }
+                let base = sheet.path.rsplit_once('/').map_or("", |(base, _)| base);
+                let path = resolve_part_path(base, target);
+                let Some(bytes) = find_part(&self.parts, &path) else {
+                    return Some(&sheet.path);
+                };
+                let unsupported = if table {
+                    table_move_unsupported(bytes, |formula| formula_affected(index, formula))
+                } else {
+                    comment_move_unsupported(bytes, |at| comment_affected(index, at))
+                };
+                if unsupported.unwrap_or(true) {
+                    return Some(&sheet.path);
+                }
+            }
+        }
+        None
+    }
+
     fn stranded(&self, disturbed: impl Fn(&UnpatchableReference) -> bool) -> Option<&str> {
         self.unpatchable_references
             .iter()
@@ -246,6 +372,176 @@ impl PreservedPackage {
             .get(index)
             .is_none_or(PreservedSheet::is_worksheet)
     }
+
+    /// The original name of a source sheet.
+    #[doc(hidden)]
+    pub fn source_sheet_name(&self, index: usize) -> Option<&str> {
+        self.original_workbook
+            .sheets
+            .get(index)
+            .map(|sheet| sheet.name.as_str())
+    }
+
+    /// The part path of a source sheet.
+    pub fn source_sheet_part(&self, index: usize) -> Option<&str> {
+        self.sheets.get(index).map(|sheet| sheet.path.as_str())
+    }
+
+    /// The `state` a source sheet's `<sheet>` entry declares; absent reads as visible.
+    pub fn source_sheet_visibility(&self, index: usize) -> Option<SheetVisibility> {
+        let sheet = self.sheets.get(index)?;
+        let state = sheet
+            .attributes
+            .iter()
+            .find(|attribute| attribute.local_name() == "state")
+            .map(|attribute| attribute.value.as_str());
+        Some(match state {
+            None | Some("visible") => SheetVisibility::Visible,
+            Some("hidden") => SheetVisibility::Hidden,
+            Some("veryHidden") => SheetVisibility::VeryHidden,
+            Some(_) => SheetVisibility::Unknown,
+        })
+    }
+
+    /// What kind of sheet a source sheet's relationship names.
+    pub fn source_sheet_kind(&self, index: usize) -> Option<SourceSheetKind> {
+        let sheet = self.sheets.get(index)?;
+        Some(
+            match sheet
+                .relationship_type
+                .as_deref()
+                .and_then(|kind| kind.rsplit('/').next())
+            {
+                None | Some("worksheet") => SourceSheetKind::Worksheet,
+                Some("chartsheet") => SourceSheetKind::Chartsheet,
+                Some("dialogsheet") => SourceSheetKind::Dialogsheet,
+                Some("xlMacrosheet" | "xlIntlMacrosheet") => SourceSheetKind::Macrosheet,
+                Some(_) => SourceSheetKind::Other,
+            },
+        )
+    }
+
+    /// Cell facts of source sheet `index` the model does not keep.
+    pub fn source_cell_facts(&self, index: usize) -> Option<&SourceCellFacts> {
+        self.sheets.get(index).map(|sheet| &sheet.cell_facts)
+    }
+
+    /// Whether source shared string `index` carried formatted runs, which the model
+    /// reads as plain text.
+    pub fn shared_string_is_rich(&self, index: usize) -> bool {
+        self.rich_shared_strings.contains(&index)
+    }
+
+    /// Whether a source sheet enables `sheetProtection`. A declaration that cannot be read
+    /// counts as enabled.
+    #[doc(hidden)]
+    pub fn source_sheet_is_protected(&self, index: usize) -> bool {
+        self.sheets
+            .get(index)
+            .and_then(|sheet| sheet.template.child("sheetProtection"))
+            .is_some_and(|protection| {
+                attributes_from_fragment(&protection.bytes).map_or(true, |attributes| {
+                    attributes.iter().any(|attribute| {
+                        attribute.local_name() == "sheet"
+                            && matches!(attribute.value.as_str(), "1" | "true")
+                    })
+                })
+            })
+    }
+
+    /// Whether a protected source sheet still lets users format cells (`formatCells="0"`).
+    /// A declaration that cannot be read allows nothing.
+    #[doc(hidden)]
+    pub fn source_sheet_allows_format_cells(&self, index: usize) -> bool {
+        self.source_sheet_is_protected(index)
+            && self
+                .sheets
+                .get(index)
+                .and_then(|sheet| sheet.template.child("sheetProtection"))
+                .and_then(|protection| attributes_from_fragment(&protection.bytes).ok())
+                .is_some_and(|attributes| {
+                    attributes.iter().any(|attribute| {
+                        attribute.local_name() == "formatCells"
+                            && matches!(attribute.value.as_str(), "0" | "false")
+                    })
+                })
+    }
+}
+
+fn table_move_unsupported(
+    bytes: &[u8],
+    affected: impl Fn(&str) -> bool,
+) -> Result<bool, ParseError> {
+    let mut xml = reader(bytes);
+    let mut buffer = Vec::new();
+    let mut depth = 0;
+    loop {
+        match next_event(&mut xml, &mut buffer, &mut depth)? {
+            Event::Start(start)
+                if matches!(
+                    local_name(&start).as_slice(),
+                    b"calculatedColumnFormula" | b"totalsRowFormula"
+                ) =>
+            {
+                let formula = collect_text(&mut xml, &mut buffer, &mut depth)?;
+                if affected(&formula) {
+                    return Ok(true);
+                }
+            }
+            Event::Eof => return Ok(false),
+            _ => {}
+        }
+    }
+}
+
+fn comment_move_unsupported(
+    bytes: &[u8],
+    affected: impl Fn(CellRef) -> bool,
+) -> Result<bool, ParseError> {
+    let mut xml = reader(bytes);
+    let mut buffer = Vec::new();
+    let mut depth = 0;
+    loop {
+        match next_event(&mut xml, &mut buffer, &mut depth)? {
+            Event::Start(start)
+                if matches!(
+                    local_name(&start).as_slice(),
+                    b"comment" | b"threadedComment"
+                ) =>
+            {
+                let Some(at) =
+                    attr(&start, b"ref")?.and_then(|reference| CellRef::parse_a1(&reference).ok())
+                else {
+                    return Ok(true);
+                };
+                if affected(at) {
+                    return Ok(true);
+                }
+            }
+            Event::Eof => return Ok(false),
+            _ => {}
+        }
+    }
+}
+
+/// A sheet's `state` in the workbook part.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SheetVisibility {
+    Visible,
+    Hidden,
+    VeryHidden,
+    /// A value outside the schema.
+    Unknown,
+}
+
+/// What a workbook `<sheet>` entry's relationship names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceSheetKind {
+    Worksheet,
+    Chartsheet,
+    Dialogsheet,
+    Macrosheet,
+    Other,
 }
 
 #[derive(Clone, Debug)]
@@ -257,6 +553,7 @@ pub(crate) struct PreservedSheet {
     pub(crate) attributes: Vec<XmlAttribute>,
     pub(crate) template: XmlTemplate,
     pub(crate) shared_string_cells: SharedStringCells,
+    pub(crate) cell_facts: SourceCellFacts,
 }
 
 impl PreservedSheet {
@@ -394,8 +691,44 @@ pub(crate) struct XmlChild {
 }
 
 impl XmlTemplate {
+    pub(crate) fn render_with_attributes(
+        &self,
+        replacements: Vec<(&'static str, Option<Vec<u8>>)>,
+        rank: fn(&str) -> usize,
+        changes: &[(&str, Option<String>)],
+    ) -> Result<Vec<u8>, ParseError> {
+        let mut template = self.clone();
+        let bom = utf8_bom_len(&self.prefix);
+        let mut reader = Reader::from_reader(&self.prefix[bom..]);
+        let mut writer = Writer::new(self.prefix[..bom].to_vec());
+        loop {
+            match reader.read_event().map_err(xml_err)? {
+                Event::Start(element) => {
+                    let mut values = attributes(&element)?;
+                    for (name, value) in changes {
+                        match value {
+                            Some(value) => set_attribute(&mut values, name, name, value.clone()),
+                            None => remove_attribute(&mut values, name),
+                        }
+                    }
+                    let mut root = BytesStart::new(self.root_name.as_str());
+                    for value in &values {
+                        root.push_attribute((value.name.as_str(), value.value.as_str()));
+                    }
+                    writer.write_event(Event::Start(root)).map_err(xml_err)?;
+                    break;
+                }
+                Event::Eof => return Err(ParseError::Malformed("missing template root".into())),
+                event => writer.write_event(event.into_owned()).map_err(xml_err)?,
+            }
+        }
+        template.prefix = writer.into_inner();
+        template.render(replacements, rank)
+    }
+
     pub(crate) fn capture(data: &[u8]) -> Result<Self, ParseError> {
-        let mut reader = NsReader::from_reader(data);
+        let bom = utf8_bom_len(data);
+        let mut reader = NsReader::from_reader(&data[bom..]);
         let config = reader.config_mut();
         config.expand_empty_elements = false;
         config.check_end_names = true;
@@ -411,10 +744,10 @@ impl XmlTemplate {
         let mut spans = Vec::new();
 
         loop {
-            let before = reader.buffer_position() as usize;
+            let before = bom + reader.buffer_position() as usize;
             let (namespace, event) = reader.read_resolved_event().map_err(xml_err)?;
             let namespace = resolved_namespace(namespace);
-            let after = reader.buffer_position() as usize;
+            let after = bom + reader.buffer_position() as usize;
             match event {
                 Event::Start(element) => {
                     if depth == 0 {
@@ -644,18 +977,27 @@ impl XmlTemplate {
         reader.config_mut().expand_empty_elements = false;
         let mut depth = 0_usize;
         let mut names = Vec::new();
+        let mut wrappers = Vec::new();
+        let mut logical_depth = 0_usize;
         loop {
             let (namespace, event) = reader.read_resolved_event().map_err(xml_err)?;
             let namespace = resolved_namespace(namespace);
-            let branch_content = depth == 3 && namespace.as_deref() == self.root_namespace();
+            let branch_content =
+                logical_depth == 1 && namespace.as_deref() == self.root_namespace();
             match event {
                 Event::Start(element) => {
-                    if branch_content {
+                    let wrapper = matches!(
+                        element.local_name().as_ref(),
+                        b"AlternateContent" | b"Choice" | b"Fallback"
+                    );
+                    wrappers.push(wrapper);
+                    if !wrapper && branch_content {
                         names.push(
                             String::from_utf8_lossy(element.name().local_name().as_ref())
                                 .into_owned(),
                         );
                     }
+                    logical_depth += usize::from(!wrapper);
                     depth += 1;
                     if depth > MAX_DEPTH {
                         return Err(ParseError::DepthExceeded);
@@ -669,12 +1011,32 @@ impl XmlTemplate {
                         );
                     }
                 }
-                Event::End(_) => depth = depth.saturating_sub(1),
+                Event::End(_) => {
+                    if wrappers.pop() == Some(false) {
+                        logical_depth = logical_depth.saturating_sub(1);
+                    }
+                    depth = depth.saturating_sub(1);
+                }
                 Event::Eof => break,
                 _ => {}
             }
         }
         Ok(names)
+    }
+
+    pub(crate) fn require_unwrapped_child(&self, name: &str) -> Result<(), ParseError> {
+        for child in &self.children {
+            if self
+                .alternate_content_names(child)?
+                .iter()
+                .any(|covered| covered == name)
+            {
+                return Err(ParseError::UnsupportedEdit(format!(
+                    "{name} lives inside an mc:AlternateContent branch"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Replaces every child with `local_name` by the supplied fragments, in
@@ -810,12 +1172,13 @@ impl XmlTemplate {
         if changes.is_empty() {
             return Ok(self.prefix.clone());
         }
-        let mut reader = Reader::from_reader(self.prefix.as_slice());
+        let bom = utf8_bom_len(&self.prefix);
+        let mut reader = Reader::from_reader(&self.prefix[bom..]);
         loop {
-            let before = reader.buffer_position() as usize;
+            let before = bom + reader.buffer_position() as usize;
             match reader.read_event().map_err(xml_err)? {
                 Event::Start(element) => {
-                    let after = reader.buffer_position() as usize;
+                    let after = bom + reader.buffer_position() as usize;
                     let mut attributes = attributes(&element)?;
                     for (name, value) in changes {
                         set_attribute(&mut attributes, name, name, value.clone());
@@ -1049,7 +1412,7 @@ fn parse_sheet_entries(data: &[u8]) -> Result<Vec<SheetEntry>, ParseError> {
     let mut entries = Vec::new();
     loop {
         match next_event(&mut reader, &mut buffer, &mut depth)? {
-            Event::Start(element) if local_name(&element) == b"sheets" => {
+            Event::Start(element) if local_name(&element) == b"sheets" && depth == 2 => {
                 sheets_depth = Some(depth);
             }
             Event::Start(element)
@@ -1073,6 +1436,17 @@ fn parse_sheet_entries(data: &[u8]) -> Result<Vec<SheetEntry>, ParseError> {
         }
     }
     Ok(entries)
+}
+
+/// The relationship each id names, read as the reader reads it: the last one
+/// with that id that has a target, so duplicate ids resolve the same way on
+/// open, on save and on reopen.
+pub(crate) fn relationships_by_id(relationships: &[Relationship]) -> HashMap<&str, &Relationship> {
+    relationships
+        .iter()
+        .filter(|relationship| relationship.target().is_some())
+        .filter_map(|relationship| relationship.id().map(|id| (id, relationship)))
+        .collect()
 }
 
 fn part_reference(

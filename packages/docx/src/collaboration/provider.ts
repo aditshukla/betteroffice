@@ -8,12 +8,18 @@ import {
   encodeSyncStep1,
   encodeSyncStep2,
   encodeUpdate,
+  MAX_FRAME_BYTES,
+  maxSyncPayloadBytes,
+  requestsChunkedSync,
+  syncFrameBytes,
+  withChunkedSyncRequest,
 } from './protocol';
 import {
   awarenessPeers,
   expireAwarenessRecords,
   MAX_AWARENESS_CURSOR_BYTES,
   MAX_AWARENESS_STRING_LENGTH,
+  MAX_AWARENESS_TRACKED_PEERS,
   reduceAwarenessEntries,
   reduceTypingInference,
   resolvePresenceColor,
@@ -21,6 +27,7 @@ import {
 } from './awareness';
 import {
   CollaborationError,
+  type AsyncCollaborationReplica,
   type CollaborationCursor,
   type CollaborationErrorCode,
   type CollaborationErrorListener,
@@ -36,17 +43,36 @@ import {
   type CollaborationTransport,
   type CollaborationTransportEvent,
 } from './types';
+import { asyncReplicaFor } from './asyncReplica';
 
 const DEFAULT_MAX_PENDING_BYTES = 16 * 1024 * 1024;
+const DEFAULT_MAX_SYNC_BYTES = 64 * 1024 * 1024;
+/** Upper bound for `maxPendingBytes` and `maxSyncBytes`. */
+const MAX_BUFFERED_BYTES = 256 * 1024 * 1024;
+/** What a held update costs beyond its bytes, so empty updates cannot pile up for free. */
+const HELD_UPDATE_OVERHEAD_BYTES = 64;
 const CURSOR_BROADCAST_INTERVAL_MS = 80;
 const HEARTBEAT_INTERVAL_MS = 20_000;
 const PEER_EXPIRY_MS = 45_000;
 const EXPIRY_SWEEP_INTERVAL_MS = 5_000;
 type Timer = ReturnType<typeof setTimeout>;
 
-function validateLimit(name: string, value: number, allowZero: boolean): number {
-  if (!Number.isSafeInteger(value) || value < (allowZero ? 0 : 1)) {
-    throw new RangeError(`${name} must be ${allowZero ? 'a non-negative' : 'a positive'} integer`);
+function validateLimit(name: string, value: number, allowZero: boolean, max: number): number {
+  if (!Number.isSafeInteger(value) || value < (allowZero ? 0 : 1) || value > max) {
+    throw new RangeError(
+      `${name} must be ${allowZero ? 'a non-negative' : 'a positive'} integer no greater than ${max}`
+    );
+  }
+  return value;
+}
+
+function requireUpdates(value: unknown, operation: string): Uint8Array[] {
+  if (
+    !Array.isArray(value) ||
+    value.length === 0 ||
+    !value.every((update) => update instanceof Uint8Array && update.byteLength > 0)
+  ) {
+    throw new TypeError(`${operation} must return a non-empty array of non-empty Uint8Array`);
   }
   return value;
 }
@@ -144,18 +170,44 @@ function typingInference(value: unknown): CollaborationTextInsertion | null {
   };
 }
 
+function isReplicaMessage(message: ReturnType<typeof decodeMessages>[number]): boolean {
+  return message.type === 'sync-step-1' || message.type === 'sync-step-2' || message.type === 'update';
+}
+
+/** Applies one sync's held updates and its SyncStep2 update; a replica without the method takes them one by one. */
+function applySync(
+  replica: Pick<CollaborationReplica, 'applyUpdate' | 'applyUpdateChunks'>,
+  held: readonly Uint8Array[],
+  update: Uint8Array
+): unknown {
+  if (held.length === 0) return replica.applyUpdate(update);
+  return replica.applyUpdateChunks!([...held, update]);
+}
+
 export class CollaborationProvider {
   private readonly replica: CollaborationReplica;
+  private readonly asyncReplica: AsyncCollaborationReplica | undefined;
+  private replicaTail: Promise<void> = Promise.resolve();
+  private replicaBytes = 0;
+  private openEpoch = 0;
   private readonly transport: CollaborationTransport;
   private readonly maxFrameBytes: number;
   private readonly maxMessagesPerFrame: number;
   private readonly maxPendingBytes: number;
+  private readonly syncChunkBytes: number | undefined;
+  private readonly maxSyncBytes: number;
+  private syncHeld: Uint8Array[] | null = null;
+  private syncHeldBytes = 0;
   private readonly localUser: CollaborationResolvedUser | null;
   private readonly statusListeners = new Map<number, CollaborationStatusListener>();
   private readonly errorListeners = new Map<number, CollaborationErrorListener>();
   private readonly peerListeners = new Map<number, CollaborationPeerListener>();
   private readonly pendingFrames: Uint8Array[] = [];
   private awarenessRecords: ReadonlyMap<number, AwarenessRecord> = new Map();
+  private readonly awarenessGenerations = new Map<number, number>();
+  private awarenessGeneration = 0;
+  private awarenessFloor = 0;
+  private readonly arrivalsInFlight = new Map<number, number>();
   private unsubscribeReplica: () => void;
   private unsubscribeTransport: () => void = () => {};
   private hasTransportSubscription = false;
@@ -183,21 +235,34 @@ export class CollaborationProvider {
     options: CollaborationProviderOptions = {}
   ) {
     this.replica = replica;
+    this.asyncReplica = asyncReplicaFor(replica);
     this.transport = transport;
     this.maxFrameBytes = validateLimit(
       'maxFrameBytes',
       options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES,
-      false
+      false,
+      MAX_FRAME_BYTES
     );
     this.maxMessagesPerFrame = validateLimit(
       'maxMessagesPerFrame',
       options.maxMessagesPerFrame ?? DEFAULT_MAX_MESSAGES_PER_FRAME,
-      false
+      false,
+      Number.MAX_SAFE_INTEGER
     );
     this.maxPendingBytes = validateLimit(
       'maxPendingBytes',
       options.maxPendingBytes ?? DEFAULT_MAX_PENDING_BYTES,
-      true
+      true,
+      MAX_BUFFERED_BYTES
+    );
+    this.syncChunkBytes = options.syncChunkBytes === undefined
+      ? undefined
+      : validateLimit('syncChunkBytes', options.syncChunkBytes, false, this.maxFrameBytes);
+    this.maxSyncBytes = validateLimit(
+      'maxSyncBytes',
+      options.maxSyncBytes ?? DEFAULT_MAX_SYNC_BYTES,
+      false,
+      MAX_BUFFERED_BYTES
     );
     this.localUser = resolveUser(options.user, replica.clientId);
 
@@ -320,6 +385,7 @@ export class CollaborationProvider {
       this.connectionStatus !== 'disconnected';
     if (!active) return;
 
+    this.resetReplicaQueue();
     this.sendLeaveBestEffort();
     this.stopPresence();
     this.wantsConnection = false;
@@ -342,6 +408,7 @@ export class CollaborationProvider {
       this.hasTransportSubscription ||
       this.connectionStatus === 'connecting' ||
       this.connectionStatus === 'connected';
+    this.resetReplicaQueue();
     this.sendLeaveBestEffort();
     this.stopPresence();
     this.isDestroyed = true;
@@ -388,6 +455,7 @@ export class CollaborationProvider {
   private failConnection(token: number, error: CollaborationError): void {
     if (!this.isCurrent(token)) return;
 
+    this.resetReplicaQueue();
     this.stopPresence();
     this.wantsConnection = false;
     this.isOpen = false;
@@ -445,6 +513,7 @@ export class CollaborationProvider {
         if (this.isOpen) this.handleMessage(token, event.data);
         break;
       case 'close':
+        this.resetReplicaQueue();
         this.isOpen = false;
         this.connectAttempt += 1;
         this.stopPresence();
@@ -470,10 +539,35 @@ export class CollaborationProvider {
 
   private handleOpen(token: number): void {
     if (this.isOpen) return;
+    const connection = ++this.openEpoch;
+    this.replicaTail = Promise.resolve();
+    this.replicaBytes = 0;
+    this.syncHeld =
+      typeof (this.asyncReplica ?? this.replica).applyUpdateChunks === 'function' ? [] : null;
+    this.syncHeldBytes = 0;
     this.isOpen = true;
     this.clearPending();
     this.setStatus('connected', false);
     if (!this.isCurrent(token) || !this.isOpen) return;
+
+    if (this.asyncReplica) {
+      const opening = Promise.resolve().then(() => {
+        if (!this.isCurrentOpen(token, connection)) return undefined;
+        return this.asyncReplica!.encodeStateVector();
+      });
+      void opening.then((vector) => {
+        if (!this.isCurrentOpen(token, connection)) return;
+        this.sendHandshake(token, requireBytes(vector, 'encodeStateVector'), connection);
+      }).catch((cause) => {
+        if (this.isCurrentOpen(token, connection)) {
+          this.failConnection(
+            token,
+            normalizeError('replica', 'Failed to encode replica state vector', cause)
+          );
+        }
+      });
+      return;
+    }
 
     let stateVector: Uint8Array;
     try {
@@ -486,8 +580,15 @@ export class CollaborationProvider {
       return;
     }
 
+    this.sendHandshake(token, stateVector, connection);
+  }
+
+  private sendHandshake(token: number, stateVector: Uint8Array, connection: number): void {
+    if (!this.isCurrentOpen(token, connection)) return;
     try {
-      this.sendFrame(encodeSyncStep1(stateVector, this.maxFrameBytes));
+      this.sendFrame(
+        encodeSyncStep1(this.syncHeld ? withChunkedSyncRequest(stateVector) : stateVector, this.maxFrameBytes)
+      );
     } catch (cause) {
       this.failConnection(
         token,
@@ -495,23 +596,28 @@ export class CollaborationProvider {
       );
       return;
     }
-    if (!this.localUser || !this.isCurrent(token) || !this.isOpen) return;
+    if (!this.localUser || !this.isCurrentOpen(token, connection)) return;
 
     try {
       this.sendFrame(encodeQueryAwareness(this.maxFrameBytes));
     } catch (cause) {
       this.report(normalizeError('protocol', 'Failed to encode awareness query', cause));
     }
-    if (!this.isCurrent(token) || !this.isOpen) return;
+    if (!this.isCurrentOpen(token, connection)) return;
     this.broadcastLocalAwareness();
-    if (!this.isCurrent(token) || !this.isOpen) return;
+    if (!this.isCurrentOpen(token, connection)) return;
     this.startPresence();
   }
 
-  private handleMessage(token: number, data: Uint8Array): void {
+  private handleMessage(
+    token: number,
+    data: Uint8Array,
+    decoded?: ReturnType<typeof decodeMessages>
+  ): void {
+    const connection = this.openEpoch;
     let messages: ReturnType<typeof decodeMessages>;
     try {
-      messages = decodeMessages(data.slice(), this.maxFrameBytes, this.maxMessagesPerFrame);
+      messages = decoded ?? decodeMessages(data.slice(), this.maxFrameBytes, this.maxMessagesPerFrame);
     } catch (cause) {
       this.failConnection(
         token,
@@ -520,15 +626,44 @@ export class CollaborationProvider {
       return;
     }
 
+    if (this.asyncReplica && !decoded) {
+      const frame = { connection, bytes: data.byteLength, remaining: 0 };
+      let charged = false;
+      for (const message of messages) {
+        if (!this.isCurrentOpen(token, connection)) return;
+        if (message.type === 'update' && this.syncHeld) {
+          if (!this.holdSyncUpdate(token, message.update)) return;
+        } else if (isReplicaMessage(message)) {
+          if (!charged) {
+            if (frame.bytes > this.maxPendingBytes - this.replicaBytes) {
+              this.failConnection(
+                token,
+                new CollaborationError('backpressure', 'Pending replica data exceeds the byte limit')
+              );
+              return;
+            }
+            this.replicaBytes += frame.bytes;
+            charged = true;
+          }
+          frame.remaining += 1;
+          const held = message.type === 'sync-step-2' ? this.takeSyncHeld() : [];
+          this.enqueueReplicaMessages(token, frame, [message], held);
+        } else {
+          this.handleMessage(token, new Uint8Array(), [message]);
+        }
+      }
+      return;
+    }
+
     for (const message of messages) {
       if (!this.isCurrent(token) || !this.isOpen) return;
 
       switch (message.type) {
         case 'sync-step-1':
-          this.respondToSyncStep1(token, message.stateVector);
+          this.respondToSyncStep1(token, connection, message.stateVector);
           break;
         case 'sync-step-2':
-          if (this.applyRemoteUpdate(token, message.update, false) && this.isCurrent(token)) {
+          if (this.applySyncStep2(token, message.update) && this.isCurrent(token)) {
             this.setStatus('connected', true);
             if (this.localUser) {
               try {
@@ -542,7 +677,8 @@ export class CollaborationProvider {
           }
           break;
         case 'update':
-          this.applyRemoteUpdate(token, message.update, true);
+          if (this.syncHeld) this.holdSyncUpdate(token, message.update);
+          else this.applyRemoteUpdate(token, message.update, true);
           break;
         case 'awareness': {
           const discarded: unknown[] = [];
@@ -557,7 +693,7 @@ export class CollaborationProvider {
               this.replica.clientId,
               nowMs()
             );
-            this.awarenessRecords = reduction.records;
+            this.setAwarenessRecords(reduction.records);
             if (reduction.peersChanged) this.emitPeers();
           } catch (cause) {
             this.report(normalizeError('protocol', 'Failed to apply awareness update', cause));
@@ -588,13 +724,100 @@ export class CollaborationProvider {
     }
   }
 
-  private respondToSyncStep1(token: number, remoteStateVector: Uint8Array): void {
-    let update: Uint8Array;
+  private isCurrentOpen(token: number, connection: number): boolean {
+    return this.isCurrent(token) && this.isOpen && connection === this.openEpoch;
+  }
+
+  private resetReplicaQueue(): void {
+    this.openEpoch += 1;
+    this.replicaTail = Promise.resolve();
+    this.replicaBytes = 0;
+    this.syncHeld = null;
+    this.syncHeldBytes = 0;
+    this.arrivalsInFlight.clear();
+    this.awarenessGenerations.clear();
+  }
+
+  private enqueueReplicaMessages(
+    token: number,
+    frame: { connection: number; bytes: number; remaining: number },
+    messages: ReturnType<typeof decodeMessages>,
+    held: readonly Uint8Array[] = []
+  ): void {
+    const connection = frame.connection;
+    if (!this.isCurrentOpen(token, connection)) return;
+    const awarenessAtArrival = this.awarenessGeneration;
+    this.arrivalsInFlight.set(awarenessAtArrival, (this.arrivalsInFlight.get(awarenessAtArrival) ?? 0) + 1);
+    const operation = this.replicaTail.then(async () => {
+      for (const message of messages) {
+        if (!this.isCurrentOpen(token, connection)) return;
+        try {
+          if (message.type === 'sync-step-1') {
+            const replica = this.asyncReplica!;
+            const updates = this.chunksAnswer(message.stateVector, replica)
+              ? requireUpdates(
+                await replica.encodeStateAsUpdateChunks!(message.stateVector.slice(), this.syncChunkLimit()),
+                'encodeStateAsUpdateChunks'
+              )
+              : [requireBytes(await replica.encodeStateAsUpdate(message.stateVector.slice()), 'encodeStateAsUpdate')];
+            if (!this.isCurrentOpen(token, connection)) return;
+            this.sendSyncAnswer(token, updates, () => this.isCurrentOpen(token, connection));
+            if (!this.isCurrentOpen(token, connection)) return;
+          } else if (message.type === 'sync-step-2' || message.type === 'update') {
+            const applied = message.type === 'sync-step-2'
+              ? await applySync(this.asyncReplica!, held, message.update.slice())
+              : await this.asyncReplica!.applyUpdate(message.update.slice());
+            if (!this.isCurrentOpen(token, connection)) return;
+            if (message.type === 'sync-step-2') {
+              this.setStatus('connected', true);
+              if (!this.isCurrentOpen(token, connection)) return;
+              if (this.localUser) {
+                try {
+                  this.sendFrame(encodeQueryAwareness(this.maxFrameBytes));
+                } catch (cause) {
+                  this.report(
+                    normalizeError('protocol', 'Failed to query awareness after sync', cause)
+                  );
+                }
+              }
+            } else {
+              this.applyTypingInference(applied, awarenessAtArrival);
+            }
+          }
+        } catch (cause) {
+          if (this.isCurrentOpen(token, connection)) {
+            this.failConnection(
+              token,
+              normalizeError(
+                'replica',
+                message.type === 'sync-step-1'
+                  ? 'Failed to encode replica update'
+                  : 'Failed to apply remote update',
+                cause
+              )
+            );
+          }
+          return;
+        }
+      }
+    }).finally(() => {
+      frame.remaining -= messages.length;
+      if (connection !== this.openEpoch) return;
+      if (frame.remaining === 0) this.replicaBytes -= frame.bytes;
+      this.settleArrival(awarenessAtArrival);
+    });
+    this.replicaTail = operation.catch(() => {});
+  }
+
+  private respondToSyncStep1(token: number, connection: number, remoteStateVector: Uint8Array): void {
+    let updates: Uint8Array[];
     try {
-      update = requireBytes(
-        this.replica.encodeStateAsUpdate(remoteStateVector.slice()),
-        'encodeStateAsUpdate'
-      );
+      updates = this.chunksAnswer(remoteStateVector, this.replica)
+        ? requireUpdates(
+          this.replica.encodeStateAsUpdateChunks!(remoteStateVector.slice(), this.syncChunkLimit()),
+          'encodeStateAsUpdateChunks'
+        )
+        : [requireBytes(this.replica.encodeStateAsUpdate(remoteStateVector.slice()), 'encodeStateAsUpdate')];
     } catch (cause) {
       this.failConnection(
         token,
@@ -602,28 +825,84 @@ export class CollaborationProvider {
       );
       return;
     }
+    this.sendSyncAnswer(token, updates, () => this.isCurrentOpen(token, connection));
+  }
 
-    try {
-      this.sendFrame(encodeSyncStep2(update, this.maxFrameBytes));
-    } catch (cause) {
-      this.failConnection(token, normalizeError('protocol', 'Failed to encode SyncStep2', cause));
+  /**
+   * Chunks only when `syncChunkBytes` is set and the SyncStep1 asks for it: that peer holds the chunks and applies them
+   * as one change. A peer applying them one at a time, such as another peer in a room, would run its repairs on
+   * partial states.
+   */
+  private chunksAnswer(
+    remoteStateVector: Uint8Array,
+    replica: Pick<CollaborationReplica | AsyncCollaborationReplica, 'encodeStateAsUpdateChunks'>
+  ): boolean {
+    return (
+      this.syncChunkBytes !== undefined &&
+      typeof replica.encodeStateAsUpdateChunks === 'function' &&
+      requestsChunkedSync(remoteStateVector)
+    );
+  }
+
+  /** Largest update a chunked sync answer may carry: `syncChunkBytes`, within one frame. */
+  private syncChunkLimit(): number {
+    return Math.max(1, Math.min(this.syncChunkBytes!, maxSyncPayloadBytes(this.maxFrameBytes)));
+  }
+
+  /**
+   * Sends every update but the last as an Update and the last as the SyncStep2 that completes the answer, encoding one
+   * frame at a time once all are known to fit.
+   */
+  private sendSyncAnswer(token: number, updates: readonly Uint8Array[], current: () => boolean): void {
+    if (updates.some((update) => syncFrameBytes(update.byteLength) > this.maxFrameBytes)) {
+      this.failConnection(
+        token,
+        new CollaborationError('protocol', `Failed to encode SyncStep2: Frame exceeds ${this.maxFrameBytes} bytes`)
+      );
+      return;
+    }
+    for (let index = 0; index < updates.length; index++) {
+      if (!current()) return;
+      let frame: Uint8Array;
+      try {
+        frame = index === updates.length - 1
+          ? encodeSyncStep2(updates[index], this.maxFrameBytes)
+          : encodeUpdate(updates[index], this.maxFrameBytes);
+      } catch (cause) {
+        this.failConnection(token, normalizeError('protocol', 'Failed to encode SyncStep2', cause));
+        return;
+      }
+      this.sendFrame(frame);
     }
   }
 
-  private applyRemoteUpdate(token: number, update: Uint8Array, inferTyping: boolean): boolean {
+  /** Holds a pre-sync update for the SyncStep2; past `maxSyncBytes` the connection fails. */
+  private holdSyncUpdate(token: number, update: Uint8Array): boolean {
+    const cost = update.byteLength + HELD_UPDATE_OVERHEAD_BYTES;
+    if (cost > this.maxSyncBytes - this.syncHeldBytes) {
+      this.failConnection(
+        token,
+        new CollaborationError('backpressure', `Initial sync exceeds ${this.maxSyncBytes} bytes`)
+      );
+      return false;
+    }
+    this.syncHeld!.push(update);
+    this.syncHeldBytes += cost;
+    return true;
+  }
+
+  /** Ends holding for this connection and returns what was held. */
+  private takeSyncHeld(): Uint8Array[] {
+    const held = this.syncHeld ?? [];
+    this.syncHeld = null;
+    this.syncHeldBytes = 0;
+    return held;
+  }
+
+  private applySyncStep2(token: number, update: Uint8Array): boolean {
+    const held = this.takeSyncHeld();
     try {
-      const applied = this.replica.applyUpdate(update.slice());
-      const inference = inferTyping ? typingInference(applied) : null;
-      if (inference) {
-        const reduction = reduceTypingInference(
-          this.awarenessRecords,
-          inference,
-          this.replica.clientId,
-          nowMs()
-        );
-        this.awarenessRecords = reduction.records;
-        if (reduction.peersChanged) this.emitPeers();
-      }
+      applySync(this.replica, held, update.slice());
       return true;
     } catch (cause) {
       this.failConnection(
@@ -632,6 +911,70 @@ export class CollaborationProvider {
       );
       return false;
     }
+  }
+
+  private applyRemoteUpdate(token: number, update: Uint8Array, inferTyping: boolean): boolean {
+    try {
+      const applied = this.replica.applyUpdate(update.slice());
+      if (inferTyping) this.applyTypingInference(applied);
+      return true;
+    } catch (cause) {
+      this.failConnection(
+        token,
+        normalizeError('replica', 'Failed to apply remote update', cause)
+      );
+      return false;
+    }
+  }
+
+  private settleArrival(generation: number): void {
+    const remaining = this.arrivalsInFlight.get(generation)! - 1;
+    if (remaining > 0) this.arrivalsInFlight.set(generation, remaining);
+    else this.arrivalsInFlight.delete(generation);
+    if (this.arrivalsInFlight.size === 0) {
+      this.awarenessGenerations.clear();
+      return;
+    }
+    const [oldest] = this.arrivalsInFlight.keys();
+    for (const [clientId, changed] of this.awarenessGenerations) {
+      if (changed <= oldest) this.awarenessGenerations.delete(clientId);
+    }
+  }
+
+  private setAwarenessRecords(records: ReadonlyMap<number, AwarenessRecord>): void {
+    if (this.arrivalsInFlight.size > 0 && records !== this.awarenessRecords) {
+      for (const [clientId, record] of records) {
+        if (record.clock === this.awarenessRecords.get(clientId)?.clock) continue;
+        this.awarenessGenerations.set(clientId, ++this.awarenessGeneration);
+      }
+      for (const clientId of this.awarenessRecords.keys()) {
+        if (records.has(clientId)) continue;
+        this.awarenessGenerations.set(clientId, ++this.awarenessGeneration);
+      }
+      if (this.awarenessGenerations.size > MAX_AWARENESS_TRACKED_PEERS) {
+        this.awarenessGenerations.clear();
+        this.awarenessFloor = this.awarenessGeneration;
+      }
+    }
+    this.awarenessRecords = records;
+  }
+
+  private applyTypingInference(applied: unknown, awarenessAtArrival?: number): void {
+    const inference = typingInference(applied);
+    if (!inference) return;
+    if (
+      awarenessAtArrival !== undefined &&
+      (awarenessAtArrival < this.awarenessFloor ||
+        (this.awarenessGenerations.get(inference.clientId) ?? 0) > awarenessAtArrival)
+    ) return;
+    const reduction = reduceTypingInference(
+      this.awarenessRecords,
+      inference,
+      this.replica.clientId,
+      nowMs()
+    );
+    this.awarenessRecords = reduction.records;
+    if (reduction.peersChanged) this.emitPeers();
   }
 
   private forwardLocalUpdate(update: Uint8Array): void {
@@ -750,7 +1093,7 @@ export class CollaborationProvider {
         nowMs(),
         PEER_EXPIRY_MS
       );
-      this.awarenessRecords = reduction.records;
+      this.setAwarenessRecords(reduction.records);
       if (reduction.peersChanged) this.emitPeers();
     }, EXPIRY_SWEEP_INTERVAL_MS);
     unrefTimer(this.heartbeatTimer);
@@ -764,7 +1107,8 @@ export class CollaborationProvider {
     this.heartbeatTimer = null;
     this.expiryTimer = null;
     const hadPeers = awarenessPeers(this.awarenessRecords).length > 0;
-    this.awarenessRecords = new Map();
+    this.setAwarenessRecords(new Map());
+    this.awarenessGenerations.clear();
     if (hadPeers) this.emitPeers();
   }
 
