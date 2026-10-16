@@ -2140,10 +2140,20 @@ impl WorkbookAuthority {
                         }
                         authored_cells.insert((key, *at));
                     }
-                    (Op::SetColWidth { col, .. }, Some(key)) => {
+                    (
+                        Op::SetColWidth { col, .. }
+                        | Op::SetColVisibility { col, .. }
+                        | Op::RestoreColDimension { col, .. },
+                        Some(key),
+                    ) => {
                         col_widths.insert((key, *col));
                     }
-                    (Op::SetRowHeight { row, .. }, Some(key)) => {
+                    (
+                        Op::SetRowHeight { row, .. }
+                        | Op::SetRowVisibility { row, .. }
+                        | Op::RestoreRowDimension { row, .. },
+                        Some(key),
+                    ) => {
                         row_heights.insert((key, *row));
                     }
                     (Op::SetFreezePane { .. }, Some(key)) => {
@@ -3394,7 +3404,11 @@ fn op_sheet(op: &Op) -> Option<SheetId> {
         | Op::InsertCols { sheet, .. }
         | Op::DeleteCols { sheet, .. }
         | Op::SetColWidth { sheet, .. }
+        | Op::SetColVisibility { sheet, .. }
+        | Op::RestoreColDimension { sheet, .. }
         | Op::SetRowHeight { sheet, .. }
+        | Op::SetRowVisibility { sheet, .. }
+        | Op::RestoreRowDimension { sheet, .. }
         | Op::SetFreezePane { sheet, .. }
         | Op::SetHyperlinks { sheet, .. }
         | Op::RestoreColStyles { sheet, .. }
