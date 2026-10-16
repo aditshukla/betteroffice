@@ -4871,6 +4871,8 @@ impl CalculationScope {
             | Op::UnmergeCells { .. }
             | Op::SetFreezePane { .. }
             | Op::SetHyperlinks { .. }
+            | Op::SetHyperlink { .. }
+            | Op::RemoveHyperlink { .. }
             | Op::RestoreColStyles { .. }
             | Op::RestoreRowStyles { .. }
             | Op::SetCharts { .. }
