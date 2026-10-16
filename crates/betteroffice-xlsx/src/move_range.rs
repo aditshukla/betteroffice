@@ -5,7 +5,75 @@ use xlsx_calc::parser::Expr;
 use xlsx_model::{CellRange, CellRef, SheetId, Workbook as WorkbookModel};
 use xlsx_ops::{CellState, Op};
 
+use crate::workbook::PreservedSheetState;
 use crate::{Error, Result};
+
+pub(crate) fn preserved_move_unsupported_part<'a>(
+    package: &'a xlsx_parse::PreservedPackage,
+    model: &WorkbookModel,
+    preserved: &PreservedSheetState,
+    sheet: SheetId,
+    source: CellRange,
+    target: CellRange,
+) -> Option<&'a str> {
+    let origin = preserved.origins.get(sheet.0 as usize).copied().flatten();
+    let axes = preserved
+        .axes
+        .get(sheet.0 as usize)
+        .and_then(Option::as_ref);
+    let current_ref = |index, at: CellRef| {
+        if Some(index) != origin {
+            return None;
+        }
+        axes.map(|axes| {
+            Some(CellRef::new(
+                axes.rows.current(at.row)?,
+                axes.cols.current(at.col)?,
+            ))
+        })
+    };
+    package.range_move_unsupported_part(
+        |index, at| match current_ref(index, at) {
+            Some(Some(at)) => source.contains(at),
+            Some(None) => false,
+            None => Some(index) == origin,
+        },
+        |index, at| match current_ref(index, at) {
+            Some(Some(at)) => source.contains(at) || target.contains(at),
+            Some(None) => false,
+            None => Some(index) == origin,
+        },
+        |index, formula| {
+            if !preserved.origins.contains(&Some(index)) {
+                return false;
+            }
+            if preserved
+                .axes
+                .iter()
+                .any(|axes| axes.as_ref().is_none_or(|axes| !axes.is_identity()))
+            {
+                return true;
+            }
+            let name = origin
+                .and_then(|origin| package.source_sheet_name(origin))
+                .unwrap_or(&model.sheets[sheet.0 as usize].name);
+            let moved_sheet = SheetId(origin.map_or(u32::MAX, |origin| origin as u32));
+            [source, target].into_iter().any(|range| {
+                !matches!(
+                    rewrite_formula(
+                        formula,
+                        SheetId(index as u32),
+                        name,
+                        moved_sheet,
+                        range,
+                        range
+                    ),
+                    Ok(None)
+                )
+            })
+        },
+    )
+}
 
 pub(crate) fn move_range_ops(
     model: &WorkbookModel,
@@ -45,10 +113,15 @@ pub(crate) fn move_range_ops(
     }
 
     let target_name = &moved_sheet.name;
+    let mut defaults = xlsx_model::workbook::ColumnDefaults::new(moved_sheet);
     let mut desired = BTreeMap::<(u32, u32, u32), CellState>::new();
     for row in source.start.row..=source.end.row {
         for col in source.start.col..=source.end.col {
-            desired.insert((sheet.0, row, col), CellState::default());
+            let cleared = CellState {
+                style: defaults.inherited_style(CellRef::new(row, col)).map(|_| 0),
+                ..CellState::default()
+            };
+            desired.insert((sheet.0, row, col), cleared);
         }
     }
     for row in source.start.row..=source.end.row {
@@ -60,6 +133,9 @@ pub(crate) fn move_range_ops(
                 .map(CellState::from)
                 .unwrap_or_default();
             let mut moved = current.clone();
+            moved.style = defaults
+                .effective_style(at)
+                .or_else(|| defaults.inherited_style(to).map(|_| 0));
             if let Some(formula) = current.formula.as_deref()
                 && let Some(rewritten) =
                     rewrite_formula(formula, sheet, target_name, sheet, source, target)?
@@ -222,6 +298,11 @@ fn rewrite_expr(
                 changed,
             )?),
         },
+        Expr::FuncCall { name, .. }
+            if name.eq_ignore_ascii_case("OFFSET") || name.eq_ignore_ascii_case("INDIRECT") =>
+        {
+            return Err(unsupported("dynamic formula references"));
+        }
         Expr::FuncCall { name, func, args } => Expr::FuncCall {
             name: name.clone(),
             func: *func,
@@ -240,31 +321,26 @@ fn rewrite_expr(
                 })
                 .collect::<Result<Vec<_>>>()?,
         },
-        Expr::RangeJoin { start, end } => {
-            let mut joined_changed = false;
-            rewrite_expr(
-                start,
-                owner,
-                target_name,
-                moved_sheet,
-                source,
-                target,
-                &mut joined_changed,
-            )?;
-            rewrite_expr(
-                end,
-                owner,
-                target_name,
-                moved_sheet,
-                source,
-                target,
-                &mut joined_changed,
-            )?;
-            if joined_changed {
-                return Err(unsupported("dynamic formula ranges"));
-            }
-            expression.clone()
+        Expr::RangeJoin { .. } => {
+            return Err(unsupported("dynamic formula ranges"));
         }
+        Expr::ArrayLiteral { cols, values } => Expr::ArrayLiteral {
+            cols: *cols,
+            values: values
+                .iter()
+                .map(|value| {
+                    rewrite_expr(
+                        value,
+                        owner,
+                        target_name,
+                        moved_sheet,
+                        source,
+                        target,
+                        changed,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?,
+        },
         _ => expression.clone(),
     })
 }

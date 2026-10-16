@@ -58,7 +58,7 @@ use crate::authority::{
     AuthorityError, HistoryUpdate, MAX_STATE_VECTOR_ENTRIES, SnapshotAdoption, StagedLocalUpdate,
     StagedUpdate, SyncOrigin, WorkbookAuthority, WorkbookStructure, is_structural_op,
 };
-use crate::move_range::move_range_ops;
+use crate::move_range::{move_range_ops, preserved_move_unsupported_part};
 use crate::sheet_json::{
     MAX_CHART_ANCHORS_PER_DRAWING, MAX_CHART_FIELD_BYTES, MAX_CHART_REFS_PER_CHART,
     MAX_CHARTS_PER_SHEET, MAX_HYPERLINK_FIELD_BYTES, MAX_HYPERLINKS_PER_SHEET,
@@ -1787,7 +1787,14 @@ impl Workbook {
         }
         if let Some(package) = self.source_package.as_ref() {
             let package = package.materialize()?;
-            if let Some(part) = package.range_move_unsupported_part() {
+            if let Some(part) = preserved_move_unsupported_part(
+                package,
+                &self.model,
+                &self.preserved,
+                sheet,
+                source,
+                target,
+            ) {
                 return Err(Error::InvalidOperation(format!(
                     "{part} contains worksheet features a cell move cannot safely preserve"
                 )));

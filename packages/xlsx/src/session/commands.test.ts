@@ -1915,9 +1915,9 @@ describe('workbook commands', () => {
         args: [0, 'A1', 'C3'],
       }))).toMatchObject({ status: 'applied', committed: true });
       expect((await session.call.cellInputs(0, 'A1:C3')).cells).toEqual([
-        [{ row: 0, col: 0, input: '', isFormula: false }, { row: 0, col: 1, input: '=C3*2', isFormula: true }, { row: 0, col: 2, input: '', isFormula: false }],
-        [{ row: 1, col: 0, input: '', isFormula: false }, { row: 1, col: 1, input: '', isFormula: false }, { row: 1, col: 2, input: '', isFormula: false }],
-        [{ row: 2, col: 0, input: '', isFormula: false }, { row: 2, col: 1, input: '', isFormula: false }, { row: 2, col: 2, input: '1', isFormula: false }],
+        [{ a1: 'A1', input: '', isFormula: false }, { a1: 'B1', input: '=C3*2', isFormula: true }, { a1: 'C1', input: '', isFormula: false }],
+        [{ a1: 'A2', input: '', isFormula: false }, { a1: 'B2', input: '', isFormula: false }, { a1: 'C2', input: '', isFormula: false }],
+        [{ a1: 'A3', input: '', isFormula: false }, { a1: 'B3', input: '', isFormula: false }, { a1: 'C3', input: '1', isFormula: false }],
       ]);
       expect(await session.submit(command(session, 2, 'editCell', {
         args: [0, 0, 2, '=SUM(B1:C3)'],
@@ -1930,8 +1930,8 @@ describe('workbook commands', () => {
       expect(await session.submit(command(session, 5, 'undo', { args: [] })))
         .toMatchObject({ status: 'applied', committed: true });
       expect((await session.call.cellInputs(0, 'A1:B1')).cells[0]).toEqual([
-        { row: 0, col: 0, input: '1', isFormula: false },
-        { row: 0, col: 1, input: '=A1*2', isFormula: true },
+        { a1: 'A1', input: '1', isFormula: false },
+        { a1: 'B1', input: '=A1*2', isFormula: true },
       ]);
       expect((await session.call.cellInputs(0, 'C3')).cells[0][0].input).toBe('');
     } finally { await session.dispose(); }
