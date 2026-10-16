@@ -9639,7 +9639,7 @@ fn hidden_custom_sizes_source() -> Vec<u8> {
     ooxml_opc::rezip_parts(&xlsx_parse::serialize_workbook(&model).unwrap()).unwrap()
 }
 
-fn assert_no_shared_hidden_sizes(workbook: &Workbook) {
+fn shared_json(workbook: &Workbook) -> yrs::Any {
     use yrs::Transact;
     use yrs::types::ToJson;
     let doc = yrs::Doc::new();
@@ -9651,7 +9651,11 @@ fn assert_no_shared_hidden_sizes(workbook: &Workbook) {
     doc.get_or_insert_map("xlsx:cell-formats");
     doc.get_or_insert_array("xlsx:sheet-order");
     let txn = doc.transact();
-    let json = doc.to_json(&txn).to_string();
+    doc.to_json(&txn)
+}
+
+fn assert_no_shared_hidden_sizes(workbook: &Workbook) {
+    let json = shared_json(workbook).to_string();
     assert!(!json.contains("hiddenColWidths"), "{json}");
     assert!(!json.contains("hiddenRowHeights"), "{json}");
     assert!(workbook.model().sheets[0].hidden_col_widths.is_empty());
@@ -9749,10 +9753,8 @@ fn collaborative_hidden_sizes_never_write_shared_keys() {
         workbook.encode_state_vector_v1(),
         expected.encode_state_vector_v1()
     );
-    assert_eq!(
-        workbook.encode_state_as_update_v1(),
-        expected.encode_state_as_update_v1()
-    );
+    // yrs redoes restored items in HashSet order, so post-undo clocks are not byte-stable
+    assert_eq!(shared_json(&workbook), shared_json(&expected));
 }
 
 #[test]
