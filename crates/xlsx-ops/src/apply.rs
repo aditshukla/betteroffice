@@ -274,36 +274,51 @@ pub fn apply_in_place(wb: &mut Workbook, op: &Op) -> Result<InvertedOp, OpError>
             }]))
         }
         Op::SetHyperlink { sheet, hyperlink } => {
+            let mut hyperlink = hyperlink.clone();
+            hyperlink.range = CellRange {
+                start: CellRef::new(hyperlink.range.start.row, hyperlink.range.start.col),
+                end: CellRef::new(hyperlink.range.end.row, hyperlink.range.end.col),
+            };
             let links = &mut sheet_mut(wb, *sheet)?.hyperlinks;
             let replaced = links
                 .iter()
                 .filter(|existing| existing.range.overlaps(&hyperlink.range))
-                .cloned()
                 .collect::<Vec<_>>();
-            if replaced.len() == 1 && replaced[0] == *hyperlink {
+            if replaced.as_slice() == [&hyperlink] {
                 return Ok(InvertedOp(vec![]));
             }
-            links.retain(|existing| !existing.range.overlaps(&hyperlink.range));
-            links.push(hyperlink.clone());
-            let mut inverse = vec![Op::RemoveHyperlink {
+            let exact = replaced.len() == 1 && replaced[0].range == hyperlink.range;
+            let old = links.clone();
+            if exact {
+                let index = links
+                    .iter()
+                    .position(|link| link.range == hyperlink.range)
+                    .unwrap();
+                links[index] = hyperlink;
+            } else {
+                links.retain(|existing| !existing.range.overlaps(&hyperlink.range));
+                links.push(hyperlink);
+            }
+            Ok(InvertedOp(vec![Op::SetHyperlinks {
                 sheet: *sheet,
-                range: hyperlink.range,
-            }];
-            inverse.extend(replaced.into_iter().map(|hyperlink| Op::SetHyperlink {
-                sheet: *sheet,
-                hyperlink,
-            }));
-            Ok(InvertedOp(inverse))
+                hyperlinks: old,
+            }]))
         }
         Op::RemoveHyperlink { sheet, range } => {
+            let range = CellRange {
+                start: CellRef::new(range.start.row, range.start.col),
+                end: CellRef::new(range.end.row, range.end.col),
+            };
             let links = &mut sheet_mut(wb, *sheet)?.hyperlinks;
-            match links.iter().position(|link| link.range == *range) {
-                Some(index) => Ok(InvertedOp(vec![Op::SetHyperlink {
-                    sheet: *sheet,
-                    hyperlink: links.remove(index),
-                }])),
-                None => Ok(InvertedOp(vec![])),
+            if !links.iter().any(|link| link.range == range) {
+                return Ok(InvertedOp(vec![]));
             }
+            let old = links.clone();
+            links.retain(|link| link.range != range);
+            Ok(InvertedOp(vec![Op::SetHyperlinks {
+                sheet: *sheet,
+                hyperlinks: old,
+            }]))
         }
         Op::RestoreColStyles { sheet, styles } => {
             let s = sheet_mut(wb, *sheet)?;
@@ -1777,6 +1792,33 @@ mod tests {
             CellValue::Text { value: "x".into() }
         );
         assert_eq!(wb.sheets[0].hyperlinks[0].range.to_a1(), "A3:B3");
+    }
+
+    #[test]
+    fn remove_hyperlink_removes_all_duplicates_and_undo_restores_their_order() {
+        let mut wb = wb_one_sheet();
+        let link = |address: &str| Hyperlink {
+            range: CellRange::parse_a1(address).unwrap(),
+            external_target: None,
+            location: Some("Data!D1".into()),
+            tooltip: None,
+            display: None,
+        };
+        wb.sheets[0].hyperlinks = vec![link("A1"), link("D4"), link("A1")];
+        let before = wb.clone();
+        let inverse = apply_in_place(
+            &mut wb,
+            &Op::RemoveHyperlink {
+                sheet: SheetId(0),
+                range: CellRange::parse_a1("$A$1").unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(wb.sheets[0].hyperlinks, vec![link("D4")]);
+        for op in inverse.0 {
+            apply_in_place(&mut wb, &op).unwrap();
+        }
+        assert_eq!(wb, before);
     }
 
     #[test]

@@ -691,6 +691,18 @@ thread_local! {
     pub(crate) static LOCAL_UPDATE_ENCODINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+fn with_schema_six_key_validation<T>(body: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SCHEMA_SIX_KEY_VALIDATION.set(self.0);
+        }
+    }
+    let _reset = Reset(SCHEMA_SIX_KEY_VALIDATION.replace(true));
+    body()
+}
+
 pub(crate) struct WorkbookAuthority {
     doc: Doc,
     projection_valid: Arc<AtomicBool>,
@@ -2078,6 +2090,7 @@ impl WorkbookAuthority {
                 require_sheet_keys(
                     &sheet_map,
                     &txn,
+                    version,
                     expected_sheet_keys,
                     optional_sheet_keys,
                     &format!("sheet {key}"),
@@ -2145,6 +2158,7 @@ impl WorkbookAuthority {
                 require_sheet_keys(
                     &sheet_map,
                     &txn,
+                    version,
                     expected_sheet_keys,
                     optional_sheet_keys,
                     &format!("inactive sheet {key}"),
@@ -4699,6 +4713,7 @@ fn require_map_keys_with_optional<T: ReadTxn>(
 fn require_sheet_keys<T: ReadTxn>(
     map: &MapRef,
     txn: &T,
+    version: i64,
     expected: &[&str],
     optional: &[&str],
     label: &str,
@@ -4716,6 +4731,9 @@ fn require_sheet_keys<T: ReadTxn>(
         if key.starts_with(MERGE_PREFIX) {
             insert_merge_edit(&mut edits, key, &value)?;
         } else if key.starts_with(HYPERLINK_PREFIX) {
+            if version < SCHEMA_VERSION {
+                return Err(format!("{label} keys do not match the schema"));
+            }
             insert_hyperlink_edit(&mut hyperlinks, key, &value)?;
         } else if !expected.contains(&key) && !optional.contains(&key) {
             return Err(format!("{label} keys do not match the schema"));
@@ -8517,9 +8535,7 @@ mod tests {
             )
             .unwrap();
         let update = current.encode_diff_v1(&before_vector).unwrap();
-        SCHEMA_SIX_KEY_VALIDATION.set(true);
-        let result = old.apply_update_v1(&update, options);
-        SCHEMA_SIX_KEY_VALIDATION.set(false);
+        let result = with_schema_six_key_validation(|| old.apply_update_v1(&update, options));
         let error = result.unwrap_err().to_string();
         assert!(
             error.contains("sheet sheet:0 keys do not match the schema"),
@@ -9033,6 +9049,140 @@ mod tests {
     }
 
     #[test]
+    fn schema_six_key_validation_resets_after_unwinding() {
+        assert!(!SCHEMA_SIX_KEY_VALIDATION.get());
+        let result = catch_unwind(|| {
+            with_schema_six_key_validation(|| {
+                assert!(SCHEMA_SIX_KEY_VALIDATION.get());
+                panic!("reset flag");
+            });
+        });
+        assert!(result.is_err());
+        assert!(!SCHEMA_SIX_KEY_VALIDATION.get());
+        with_schema_six_key_validation(|| {
+            with_schema_six_key_validation(|| assert!(SCHEMA_SIX_KEY_VALIDATION.get()));
+            assert!(SCHEMA_SIX_KEY_VALIDATION.get());
+        });
+        assert!(!SCHEMA_SIX_KEY_VALIDATION.get());
+    }
+
+    #[test]
+    fn hyperlink_snapshots_refuse_noncanonical_baselines_with_or_without_edits() {
+        for edited in [false, true] {
+            let link = test_hyperlink("A1", "Data!A1");
+            let canonical = serde_json::to_string(&[link.clone()]).unwrap();
+            let mut extra = serde_json::to_value(&link).unwrap();
+            extra
+                .as_object_mut()
+                .unwrap()
+                .insert("unknown".into(), serde_json::Value::Bool(true));
+            let mut omitted = serde_json::to_value(&link).unwrap();
+            omitted.as_object_mut().unwrap().remove("tooltip");
+            let mut anchored = link;
+            anchored.range = CellRange::parse_a1("$A$1").unwrap();
+            for json in [
+                format!(" {canonical}"),
+                canonical.replace("null", " null"),
+                serde_json::to_string(&[extra]).unwrap(),
+                serde_json::to_string(&[omitted]).unwrap(),
+                serde_json::to_string(&[anchored]).unwrap(),
+            ] {
+                let mut model = WorkbookModel::default();
+                model.sheets.push(Sheet::new("Data"));
+                model.sheets[0].hyperlinks = vec![test_hyperlink("A1", "Data!A1")];
+                let authority = WorkbookAuthority::from_model_with_client_id(&model, 260).unwrap();
+                {
+                    let mut txn = authority.doc.transact_mut();
+                    let sheet = txn
+                        .get_map(SHEETS)
+                        .unwrap()
+                        .get(&txn, "sheet:0")
+                        .unwrap()
+                        .cast::<MapRef>()
+                        .unwrap();
+                    sheet.try_update(&mut txn, HYPERLINKS, json);
+                    if edited {
+                        sheet.try_update(&mut txn, "hyperlink:Z99", false);
+                    }
+                }
+                assert!(authority.strict_materialize().is_err());
+                assert!(snapshot_validation::validate_for_test(&authority, model).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_snapshots_refuse_hyperlink_keys_in_both_validators() {
+        for version in MIN_SUPPORTED_SCHEMA_VERSION..SCHEMA_VERSION {
+            let mut model = WorkbookModel::default();
+            model.sheets.push(Sheet::new("Data"));
+            let source = WorkbookAuthority::from_model_with_client_id(&model, 261).unwrap();
+            let doc = Doc::with_client_id(263);
+            hydrate_doc(&doc, &legacy_update(&model, version, true)).unwrap();
+            let authority = WorkbookAuthority::hydrated(doc, source.base.clone(), 0);
+            assert!(authority.strict_materialize().is_ok());
+            snapshot_validation::validate_for_test(&authority, model.clone()).unwrap();
+            {
+                let mut txn = authority.doc.transact_mut();
+                let sheet = txn
+                    .get_map(SHEETS)
+                    .unwrap()
+                    .get(&txn, "sheet:0")
+                    .unwrap()
+                    .cast::<MapRef>()
+                    .unwrap();
+                sheet.try_update(&mut txn, "hyperlink:A1", false);
+            }
+            assert!(authority.strict_materialize().is_err());
+            assert!(snapshot_validation::validate_for_test(&authority, model).is_err());
+        }
+    }
+
+    #[test]
+    fn empty_optional_hyperlink_fields_are_refused_in_peer_state() {
+        for baseline in [false, true] {
+            for field in 0..4 {
+                let mut model = WorkbookModel::default();
+                model.sheets.push(Sheet::new("Data"));
+                let authority = WorkbookAuthority::from_model_with_client_id(&model, 262).unwrap();
+                let mut link = test_hyperlink("A1", "Data!A1");
+                link.external_target = Some("https://example.com".into());
+                match field {
+                    0 => link.external_target = Some(String::new()),
+                    1 => link.location = Some(String::new()),
+                    2 => link.tooltip = Some(String::new()),
+                    _ => link.display = Some(String::new()),
+                }
+                {
+                    let mut txn = authority.doc.transact_mut();
+                    let sheet = txn
+                        .get_map(SHEETS)
+                        .unwrap()
+                        .get(&txn, "sheet:0")
+                        .unwrap()
+                        .cast::<MapRef>()
+                        .unwrap();
+                    if baseline {
+                        sheet.try_update(
+                            &mut txn,
+                            HYPERLINKS,
+                            serde_json::to_string(&[link]).unwrap(),
+                        );
+                    } else {
+                        sheet.try_update(
+                            &mut txn,
+                            "hyperlink:A1",
+                            serde_json::to_string(&link).unwrap(),
+                        );
+                    }
+                }
+                assert!(authority.strict_materialize().is_err());
+                assert!(snapshot_validation::validate_for_test(&authority, model).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn flat_hyperlink_keys_validate_in_snapshots_and_refuse_schema_six_peers() {
         let mut model = rich_model();
         model.sheets[0].hyperlinks = vec![
@@ -9064,6 +9214,9 @@ mod tests {
             model.sheets[0].hyperlinks
         );
         assert!(authority.materialize_internal_oracle(true).is_err());
+        with_schema_six_key_validation(|| {
+            assert!(snapshot_validation::validate_for_test(&authority, projected.clone()).is_err());
+        });
         snapshot_validation::validate_for_test(&authority, projected).unwrap();
         assert!(snapshot_validation::validate_for_test(&authority, model.clone()).is_err());
 
@@ -9095,9 +9248,7 @@ mod tests {
             )
             .unwrap();
         let update = current.encode_diff_v1(&before_vector).unwrap();
-        SCHEMA_SIX_KEY_VALIDATION.set(true);
-        let result = old.apply_update_v1(&update, options);
-        SCHEMA_SIX_KEY_VALIDATION.set(false);
+        let result = with_schema_six_key_validation(|| old.apply_update_v1(&update, options));
         let error = result.unwrap_err().to_string();
         assert!(
             error.contains("sheet sheet:0 keys do not match the schema"),

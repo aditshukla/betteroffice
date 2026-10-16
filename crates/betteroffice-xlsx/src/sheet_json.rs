@@ -25,6 +25,7 @@ pub(crate) const MAX_CHART_FIELD_BYTES: usize = 32_767;
 pub(crate) const MAX_CHART_STATE_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_HYPERLINKS_PER_SHEET: usize = 65_536;
 pub(crate) const MAX_HYPERLINK_FIELD_BYTES: usize = 32_767;
+pub(crate) const MAX_HYPERLINK_VALUE_BYTES: usize = 4 * MAX_HYPERLINK_FIELD_BYTES * 6 + 512;
 /// upper bound on one sheet's encoded hyperlink state, sized the same way:
 /// [`MAX_HYPERLINKS_PER_SHEET`] at a realistic 256 bytes per link.
 pub(crate) const MAX_HYPERLINK_STATE_BYTES: usize = 16 * 1024 * 1024;
@@ -56,10 +57,14 @@ pub(crate) fn decode_hyperlinks(json: &str) -> Result<Vec<Hyperlink>, String> {
         return Err("sheet hyperlink state exceeds its size limit".to_string());
     }
     let mut deserializer = serde_json::Deserializer::from_str(json);
-    HyperlinksSeed
+    let hyperlinks = HyperlinksSeed
         .deserialize(&mut deserializer)
         .and_then(|hyperlinks| deserializer.end().map(|()| hyperlinks))
-        .map_err(|error| format!("sheet hyperlinks are invalid: {error}"))
+        .map_err(|error| format!("sheet hyperlinks are invalid: {error}"))?;
+    if serde_json::to_string(&hyperlinks).map_err(|error| error.to_string())? != json {
+        return Err("sheet hyperlinks are not canonical JSON".to_string());
+    }
+    Ok(hyperlinks)
 }
 
 struct BoundedString {
@@ -652,6 +657,10 @@ impl<'de> Visitor<'de> for HyperlinkSeed {
             || range.start.col > range.end.col
             || range.end.row >= MAX_ROWS
             || range.end.col >= MAX_COLS
+            || range.start.abs_row
+            || range.start.abs_col
+            || range.end.abs_row
+            || range.end.abs_col
         {
             return Err(A::Error::custom(HYPERLINK_OUT_OF_BOUNDS));
         }
@@ -662,6 +671,18 @@ impl<'de> Visitor<'de> for HyperlinkSeed {
             && hyperlink.location.as_deref().is_none_or(str::is_empty)
         {
             return Err(A::Error::custom(HYPERLINK_NO_DESTINATION));
+        }
+        if [
+            &hyperlink.external_target,
+            &hyperlink.location,
+            &hyperlink.tooltip,
+            &hyperlink.display,
+        ]
+        .into_iter()
+        .flatten()
+        .any(String::is_empty)
+        {
+            return Err(A::Error::custom("sheet hyperlink field must not be empty"));
         }
         Ok(hyperlink)
     }
@@ -834,6 +855,28 @@ mod tests {
         ];
         let json = serde_json::to_string(&hyperlinks).unwrap();
         assert_eq!(decode_hyperlinks(&json).unwrap(), hyperlinks);
+    }
+
+    #[test]
+    fn hyperlink_reader_refuses_empty_fields_anchors_and_noncanonical_json() {
+        for field in 0..4 {
+            let mut link = hyperlink();
+            link.location = Some("Sheet2!A1".into());
+            match field {
+                0 => link.external_target = Some(String::new()),
+                1 => link.location = Some(String::new()),
+                2 => link.tooltip = Some(String::new()),
+                _ => link.display = Some(String::new()),
+            }
+            assert!(decode_hyperlinks(&serde_json::to_string(&[link]).unwrap()).is_err());
+        }
+        let mut link = hyperlink();
+        link.range = CellRange::parse_a1("$A$1").unwrap();
+        assert!(decode_hyperlinks(&serde_json::to_string(&[link]).unwrap()).is_err());
+        let canonical = serde_json::to_string(&[hyperlink()]).unwrap();
+        for json in [format!(" {canonical}"), canonical.replace("null", " null")] {
+            assert!(decode_hyperlinks(&json).is_err());
+        }
     }
 
     #[test]

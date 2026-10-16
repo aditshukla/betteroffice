@@ -6068,6 +6068,175 @@ fn collaborative_hyperlinks_converge_undo_and_reopen() {
 }
 
 #[test]
+fn anchored_hyperlink_ops_match_in_both_modes() {
+    for collaborative in [false, true] {
+        let mut model = WorkbookModel::default();
+        model.sheets.push(Sheet::new("Data"));
+        let mut editor = if collaborative {
+            Workbook::from_model_collaborative(model, 1250)
+        } else {
+            Workbook::from_model(model)
+        }
+        .unwrap();
+        let options = CalculationOptions::default();
+        editor
+            .set_hyperlink(SheetId(0), internal_link("$A$1:$B$2", "Data!D1"), options)
+            .unwrap();
+        assert_eq!(
+            editor.model().sheets[0].hyperlinks[0].range.to_a1(),
+            "A1:B2"
+        );
+        editor
+            .remove_hyperlink(SheetId(0), CellRange::parse_a1("$A1:B$2").unwrap(), options)
+            .unwrap();
+        assert!(editor.model().sheets[0].hyperlinks.is_empty());
+    }
+}
+
+#[test]
+fn anchored_imported_hyperlink_ranges_are_normalized_before_collaboration() {
+    let mut model = WorkbookModel::default();
+    let mut sheet = Sheet::new("Data");
+    sheet.hyperlinks.push(internal_link("$A$1", "Data!D1"));
+    model.sheets.push(sheet);
+    let bytes = ooxml_opc::rezip_parts(&xlsx_parse::serialize_workbook(&model).unwrap()).unwrap();
+    let mut left = Workbook::open_collaborative(&bytes, 1254).unwrap();
+    let mut right = Workbook::open_collaborative(&bytes, 1255).unwrap();
+    assert_eq!(left.model().sheets[0].hyperlinks[0].range.to_a1(), "A1");
+    let before = right.encode_state_vector_v1();
+    let replacement = internal_link("A1", "Data!D2");
+    left.set_hyperlink(
+        SheetId(0),
+        replacement.clone(),
+        CalculationOptions::default(),
+    )
+    .unwrap();
+    right
+        .apply_update_v1(
+            &left.encode_diff_v1(&before).unwrap(),
+            CalculationOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(right.model().sheets[0].hyperlinks, vec![replacement]);
+    assert_eq!(left.model(), right.model());
+}
+
+#[test]
+fn empty_optional_hyperlink_fields_are_refused_locally() {
+    for collaborative in [false, true] {
+        for field in 0..4 {
+            let mut model = WorkbookModel::default();
+            model.sheets.push(Sheet::new("Data"));
+            let mut editor = if collaborative {
+                Workbook::from_model_collaborative(model, 1251)
+            } else {
+                Workbook::from_model(model)
+            }
+            .unwrap();
+            let mut link = internal_link("A1", "Data!D1");
+            link.external_target = Some("https://example.com".into());
+            match field {
+                0 => link.external_target = Some(String::new()),
+                1 => link.location = Some(String::new()),
+                2 => link.tooltip = Some(String::new()),
+                _ => link.display = Some(String::new()),
+            }
+            let before = editor.encode_state_as_update_v1();
+            assert!(
+                editor
+                    .set_hyperlink(SheetId(0), link, CalculationOptions::default())
+                    .is_err()
+            );
+            assert!(editor.model().sheets[0].hyperlinks.is_empty());
+            assert_eq!(editor.encode_state_as_update_v1(), before);
+        }
+    }
+}
+
+#[test]
+fn hyperlink_replace_and_undo_preserve_imported_order_and_sheet_bytes() {
+    let mut model = WorkbookModel::default();
+    let mut sheet = Sheet::new("Data");
+    sheet.hyperlinks = vec![
+        internal_link("D4:E5", "Data!D1"),
+        internal_link("A1:B2", "Data!D2"),
+    ];
+    model.sheets.push(sheet);
+    let bytes = ooxml_opc::rezip_parts(&xlsx_parse::serialize_workbook(&model).unwrap()).unwrap();
+    for collaborative in [false, true] {
+        for remove in [false, true] {
+            let mut editor = if collaborative {
+                Workbook::open_collaborative(&bytes, 1252)
+            } else {
+                Workbook::open(&bytes)
+            }
+            .unwrap();
+            let before = editor.model().sheets[0].hyperlinks.clone();
+            let options = CalculationOptions::default();
+            if remove {
+                editor
+                    .remove_hyperlink(SheetId(0), before[0].range, options)
+                    .unwrap();
+            } else {
+                let replacement = internal_link("D4:E5", "Data!D3");
+                editor
+                    .set_hyperlink(SheetId(0), replacement.clone(), options)
+                    .unwrap();
+                assert_eq!(
+                    editor.model().sheets[0].hyperlinks,
+                    vec![replacement, before[1].clone()]
+                );
+            }
+            editor.undo(options).unwrap();
+            assert_eq!(editor.model().sheets[0].hyperlinks, before);
+            let saved = editor.save().unwrap();
+            let original_parts = ooxml_opc::unzip_parts(&bytes)
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeMap<_, _>>();
+            let saved_parts = ooxml_opc::unzip_parts(&saved)
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(
+                saved_parts.get("xl/worksheets/sheet1.xml"),
+                original_parts.get("xl/worksheets/sheet1.xml")
+            );
+        }
+    }
+}
+
+#[test]
+fn duplicate_imported_hyperlinks_refuse_set_and_remove_atomically() {
+    let mut model = WorkbookModel::default();
+    let mut sheet = Sheet::new("Data");
+    sheet.hyperlinks = vec![
+        internal_link("A1", "Data!D1"),
+        internal_link("A1", "Data!D2"),
+    ];
+    model.sheets.push(sheet);
+    let mut editor = Workbook::from_model_collaborative(model, 1253).unwrap();
+    for remove in [false, true] {
+        let before = editor.model().clone();
+        let state = editor.encode_state_as_update_v1();
+        let options = CalculationOptions::default();
+        let result = if remove {
+            editor.remove_hyperlink(SheetId(0), CellRange::parse_a1("A1").unwrap(), options)
+        } else {
+            editor.set_hyperlink(SheetId(0), internal_link("A1", "Data!D2"), options)
+        };
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("overlapping imported hyperlinks")
+        );
+        assert_eq!(editor.model(), &before);
+        assert_eq!(editor.encode_state_as_update_v1(), state);
+    }
+}
+
+#[test]
 fn overlapping_concurrent_hyperlinks_project_identically() {
     let bytes = sample_xlsx();
     let options = CalculationOptions::default();

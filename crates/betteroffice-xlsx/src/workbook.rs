@@ -4343,6 +4343,11 @@ fn validate_hyperlinks(hyperlinks: &[Hyperlink]) -> Result<()> {
         .into_iter()
         .flatten()
         {
+            if value.is_empty() {
+                return Err(Error::InvalidOperation(
+                    "hyperlink field must not be empty".to_string(),
+                ));
+            }
             if value.len() > MAX_HYPERLINK_FIELD_BYTES {
                 return Err(Error::InvalidOperation(
                     "hyperlink field exceeds its length limit".to_string(),

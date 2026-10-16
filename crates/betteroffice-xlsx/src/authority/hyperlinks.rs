@@ -34,6 +34,9 @@ pub(super) fn insert_hyperlink_edit(
     let link = match value {
         Out::Any(Any::Bool(false)) => None,
         Out::Any(Any::String(json)) => {
+            if json.len() > crate::sheet_json::MAX_HYPERLINK_VALUE_BYTES {
+                return Err("sheet hyperlink value exceeds its size limit".to_string());
+            }
             let mut parsed = decode_hyperlinks(&format!("[{json}]"))?;
             if parsed.len() != 1 {
                 return Err(format!("hyperlink edit {key} is not one link"));
@@ -70,7 +73,15 @@ pub(super) fn sync_hyperlinks(
     let Some(Out::Any(Any::String(json))) = sheet.get(txn, HYPERLINKS) else {
         return Err("sheet is missing hyperlinks".to_string());
     };
-    let baseline = decode_hyperlinks(&json)?
+    let baseline = decode_hyperlinks(&json)?;
+    let mut occupied = MergeIndex::default();
+    for link in &baseline {
+        if occupied.overlaps(1, 0, MAX_COLS - 1, &link.range) {
+            return Err("cannot edit overlapping imported hyperlinks".to_string());
+        }
+        occupied.insert(1, 0, MAX_COLS - 1, &link.range);
+    }
+    let baseline = baseline
         .into_iter()
         .map(|link| (link.range.to_a1(), link))
         .collect::<BTreeMap<_, _>>();
@@ -176,59 +187,255 @@ impl HyperlinkProjection {
     }
 }
 
+pub(super) fn hyperlink_metadata(range: CellRange) -> Hyperlink {
+    Hyperlink {
+        range,
+        external_target: None,
+        location: None,
+        tooltip: None,
+        display: None,
+    }
+}
+
+#[derive(Default)]
+pub(super) struct HyperlinkJson {
+    offset: usize,
+    range: Option<CellRange>,
+    field: usize,
+    in_string: bool,
+    field_bytes: usize,
+    destination: bool,
+}
+
+impl HyperlinkJson {
+    pub(super) fn advance(
+        &mut self,
+        json: &str,
+        limit: usize,
+    ) -> Result<Option<CellRange>, String> {
+        use crate::sheet_json::{MAX_HYPERLINK_FIELD_BYTES, MAX_HYPERLINK_VALUE_BYTES};
+
+        let invalid = || "sheet hyperlinks are not canonical JSON".to_string();
+        if self.offset > MAX_HYPERLINK_VALUE_BYTES {
+            return Err("sheet hyperlink value exceeds its size limit".to_string());
+        }
+        if self.range.is_none() {
+            let remaining = json.strip_prefix("{\"range\":").ok_or_else(invalid)?;
+            let bytes = remaining.as_bytes();
+            let end = bytes.len().min(256);
+            let end = bytes[..end]
+                .windows(b",\"external_target\":".len())
+                .position(|bytes| bytes == b",\"external_target\":")
+                .ok_or_else(invalid)?;
+            let range: CellRange =
+                serde_json::from_str(&remaining[..end]).map_err(|_| invalid())?;
+            if range.start.row > range.end.row
+                || range.start.col > range.end.col
+                || range.end.row >= MAX_ROWS
+                || range.end.col >= MAX_COLS
+                || range.start.abs_row
+                || range.start.abs_col
+                || range.end.abs_row
+                || range.end.abs_col
+                || serde_json::to_string(&range).map_err(|_| invalid())? != remaining[..end]
+            {
+                return Err(invalid());
+            }
+            self.offset = json.len() - remaining.len() + end;
+            self.range = Some(range);
+            return Ok(None);
+        }
+        if self.field == 4 {
+            if json.as_bytes().get(self.offset) != Some(&b'}') || !self.destination {
+                return Err(invalid());
+            }
+            self.offset += 1;
+            return Ok(self.range);
+        }
+        if !self.in_string {
+            let prefix = [
+                ",\"external_target\":",
+                ",\"location\":",
+                ",\"tooltip\":",
+                ",\"display\":",
+            ][self.field];
+            let remaining = json.get(self.offset..).ok_or_else(invalid)?;
+            let remaining = remaining.strip_prefix(prefix).ok_or_else(invalid)?;
+            self.offset += prefix.len();
+            if remaining.starts_with("null") {
+                self.offset += 4;
+                self.field += 1;
+            } else if remaining.starts_with('"') {
+                self.offset += 1;
+                self.field_bytes = 0;
+                self.in_string = true;
+            } else {
+                return Err(invalid());
+            }
+            return Ok(None);
+        }
+        let bytes = json.as_bytes();
+        let end = bytes.len().min(self.offset.saturating_add(limit));
+        while self.offset < end {
+            let byte = bytes[self.offset];
+            if byte == b'"' {
+                if self.field_bytes == 0 {
+                    return Err("sheet hyperlink field must not be empty".to_string());
+                }
+                self.destination |= self.field < 2;
+                self.offset += 1;
+                self.field += 1;
+                self.in_string = false;
+                return Ok(None);
+            }
+            if byte < 32 {
+                return Err(invalid());
+            }
+            let width = if byte == b'\\' {
+                if end - self.offset < 6 && end < bytes.len() {
+                    break;
+                }
+                match bytes.get(self.offset + 1) {
+                    Some(b'"' | b'\\' | b'b' | b'f' | b'n' | b'r' | b't') => 2,
+                    Some(b'u') => {
+                        let escape = bytes
+                            .get(self.offset + 2..self.offset + 6)
+                            .ok_or_else(invalid)?;
+                        if escape[..2] != *b"00" {
+                            return Err(invalid());
+                        }
+                        let digit =
+                            |byte| b"0123456789abcdef".iter().position(|&value| value == byte);
+                        let value = digit(escape[2])
+                            .zip(digit(escape[3]))
+                            .map(|(high, low)| high * 16 + low)
+                            .ok_or_else(invalid)?;
+                        if value >= 32 || matches!(value, 8 | 9 | 10 | 12 | 13) {
+                            return Err(invalid());
+                        }
+                        6
+                    }
+                    _ => return Err(invalid()),
+                }
+            } else {
+                1
+            };
+            self.offset += width;
+            self.field_bytes += 1;
+            if self.field_bytes > MAX_HYPERLINK_FIELD_BYTES {
+                return Err("sheet hyperlink field exceeds its length limit".to_string());
+            }
+        }
+        if self.offset == bytes.len() {
+            return Err(invalid());
+        }
+        Ok(None)
+    }
+
+    pub(super) fn bytes(&self) -> usize {
+        self.offset
+    }
+}
+
+pub(super) enum HyperlinkRead {
+    Pending,
+    Link(CellRange, usize, usize),
+    Done,
+}
+
 #[derive(Default)]
 pub(super) struct HyperlinkBaseline {
     offset: usize,
     count: usize,
+    value: Option<HyperlinkJson>,
     done: bool,
 }
 
 impl HyperlinkBaseline {
-    pub(super) fn next(&mut self, json: &str) -> Result<Option<Hyperlink>, String> {
+    pub(super) fn advance(&mut self, json: &str, limit: usize) -> Result<HyperlinkRead, String> {
         use crate::sheet_json::{MAX_HYPERLINK_STATE_BYTES, MAX_HYPERLINKS_PER_SHEET};
 
-        let invalid = || "sheet hyperlinks are invalid".to_string();
+        let invalid = || "sheet hyperlinks are not canonical JSON".to_string();
         if self.done {
-            return Ok(None);
+            return Ok(HyperlinkRead::Done);
         }
         if json.len() > MAX_HYPERLINK_STATE_BYTES {
             return Err("sheet hyperlink state exceeds its size limit".to_string());
         }
-        let mut remaining = json[self.offset..].trim_start_matches([' ', '\n', '\r', '\t']);
-        if self.offset == 0 {
-            remaining = remaining
-                .strip_prefix('[')
-                .ok_or_else(invalid)?
-                .trim_start_matches([' ', '\n', '\r', '\t']);
-        } else if !remaining.starts_with(']') {
-            remaining = remaining
-                .strip_prefix(',')
-                .ok_or_else(invalid)?
-                .trim_start_matches([' ', '\n', '\r', '\t']);
-            if remaining.starts_with(']') {
-                return Err(invalid());
+        if self.value.is_none() {
+            let separator = if self.count == 0 { b'[' } else { b',' };
+            if self.offset == 0 || json.as_bytes().get(self.offset) != Some(&b']') {
+                if json.as_bytes().get(self.offset) != Some(&separator) {
+                    return Err(invalid());
+                }
+                self.offset += 1;
+                if self.count != 0 && json.as_bytes().get(self.offset) == Some(&b']') {
+                    return Err(invalid());
+                }
             }
-        }
-        if let Some(tail) = remaining.strip_prefix(']') {
-            if !tail.trim_matches([' ', '\n', '\r', '\t']).is_empty() {
-                return Err(invalid());
+            if json.as_bytes().get(self.offset) == Some(&b']') {
+                if self.offset + 1 != json.len() {
+                    return Err(invalid());
+                }
+                self.done = true;
+                return Ok(HyperlinkRead::Done);
             }
-            self.done = true;
-            return Ok(None);
+            if self.count >= MAX_HYPERLINKS_PER_SHEET {
+                return Err("sheet has too many hyperlinks".to_string());
+            }
+            self.value = Some(HyperlinkJson::default());
+            return Ok(HyperlinkRead::Pending);
         }
-        if self.count >= MAX_HYPERLINKS_PER_SHEET {
-            return Err("sheet has too many hyperlinks".to_string());
-        }
-        let deserializer = serde_json::Deserializer::from_str(remaining);
-        let mut stream = deserializer.into_iter::<serde::de::IgnoredAny>();
-        stream.next().ok_or_else(invalid)?.map_err(|_| invalid())?;
-        let end = stream.byte_offset();
-        let mut links = decode_hyperlinks(&format!("[{}]", &remaining[..end]))?;
-        if links.len() != 1 {
-            return Err(invalid());
-        }
-        self.offset = json.len() - remaining.len() + end;
+        let value = self.value.as_mut().unwrap();
+        let Some(range) = value.advance(&json[self.offset..], limit)? else {
+            return Ok(HyperlinkRead::Pending);
+        };
+        let start = self.offset;
+        self.offset += value.bytes();
         self.count += 1;
-        Ok(links.pop())
+        self.value = None;
+        Ok(HyperlinkRead::Link(range, start, self.offset))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streamed_hyperlink_json_matches_canonical_serde_and_refuses_other_encodings() {
+        for value in ["plain", "é😀", "\"\\\n\r\t\u{0000}\u{0008}\u{000c}\u{001f}"] {
+            let mut link = hyperlink_metadata(CellRange::parse_a1("A1:B2").unwrap());
+            link.location = Some(value.repeat(100));
+            let json = serde_json::to_string(&link).unwrap();
+            let mut reader = HyperlinkJson::default();
+            loop {
+                if let Some(range) = reader.advance(&json, 64).unwrap() {
+                    assert_eq!(range, link.range);
+                    assert_eq!(reader.bytes(), json.len());
+                    break;
+                }
+            }
+        }
+        let mut link = hyperlink_metadata(CellRange::parse_a1("A1").unwrap());
+        link.location = Some("a".into());
+        let canonical = serde_json::to_string(&link).unwrap();
+        for json in [
+            format!(" {canonical}"),
+            canonical.replace("\"a\"", "\"\\u0061\""),
+            canonical.replace("\"a\"", "\"\""),
+            canonical.replace("\"a\"", "null"),
+            canonical.replace("\"a\"", "\"\\u000a\""),
+            canonical.replace("\"a\"", "\"\\u001F\""),
+        ] {
+            let mut reader = HyperlinkJson::default();
+            loop {
+                match reader.advance(&json, 64) {
+                    Err(_) => break,
+                    Ok(None) => {}
+                    Ok(Some(_)) => panic!("accepted {json}"),
+                }
+            }
+        }
     }
 }
