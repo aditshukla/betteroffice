@@ -65,20 +65,20 @@ impl ModelValidation {
                 self.phase = 1;
                 self.index = 0;
             }
-            if self.phase == 10 {
+            if self.phase == 11 {
                 if let Some(name) = self.names.first() {
                     let bytes = admit(name.len().saturating_add(24), budget)?;
                     self.names.pop_first();
                     return Ok((false, 1, bytes));
                 }
-                self.phase = 11;
+                self.phase = 12;
                 return Ok((true, 0, 0));
             }
-            if self.phase == 11 {
+            if self.phase == 12 {
                 return Ok((true, 0, 0));
             }
             let Some(sheet) = model.sheets.get(self.sheet) else {
-                self.phase = 10;
+                self.phase = 11;
                 continue;
             };
             match self.phase {
@@ -362,6 +362,49 @@ mod tests {
             assert_eq!(work.bytes, *bytes);
         }
         result
+    }
+
+    #[test]
+    fn hidden_dimensions_validate_every_sheet_with_bounded_work() {
+        let budget = SnapshotBudget::new(1, 16_384).unwrap();
+        for invalid in [false, true] {
+            let mut model = Workbook {
+                sheets: (0..3)
+                    .map(|index| Sheet::new(format!("S{index}")))
+                    .collect(),
+                ..Workbook::default()
+            };
+            for sheet in &mut model.sheets {
+                sheet.col_widths.insert(1, 0.0);
+                sheet.hidden_col_widths.insert(1, 20.0);
+                sheet.row_heights.insert(2, 0.0);
+                sheet.hidden_row_heights.insert(2, 30.0);
+            }
+            if invalid {
+                model.sheets[2]
+                    .hidden_row_heights
+                    .insert(2, MAX_ROW_HEIGHT + 1.0);
+            }
+            let mut validation = ModelValidation::default();
+            let mut refused = false;
+            let mut ready = false;
+            for _ in 0..100 {
+                match step(&mut validation, &model, budget) {
+                    Ok((done, _, _)) if done => {
+                        ready = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        refused = true;
+                        break;
+                    }
+                }
+            }
+            assert_eq!(refused, invalid);
+            assert_eq!(ready, !invalid);
+            assert!(validation.names.is_empty() || invalid);
+        }
     }
 
     #[test]

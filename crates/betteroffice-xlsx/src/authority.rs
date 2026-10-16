@@ -50,8 +50,7 @@ const FREEZE_PANE_SCHEMA_VERSION: i64 = 4;
 const HYPERLINK_SCHEMA_VERSION: i64 = 5;
 const CHARTS_SCHEMA_VERSION: i64 = 6;
 const HIDDEN_DIMENSIONS_SCHEMA_VERSION: i64 = 6;
-const HIDDEN_SIZE_SCHEMA_VERSION: i64 = 7;
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 6;
 const BASE_FINGERPRINT: &str = "baseFingerprint";
 const STRUCTURE_GENERATION: &str = "structureGeneration";
 const CHARTS: &str = "charts";
@@ -192,50 +191,41 @@ impl WorkbookBase {
     ) -> Result<Self, String> {
         let mut builder = FingerprintBuilder::new(model, legacy_dimensions);
         let styles = FingerprintStyles::new(&model.styles);
-        let ((fingerprint, bootstrap_client_id), fingerprints) = builder.batched(|builder| {
-            let current_styles = if released_styles(&model.styles) {
-                styles
-            } else {
-                styles.with_written_fills()
-            };
-            let current = builder.current(current_styles)?;
-            let mut fingerprints =
-                builder.accepted_fingerprints(styles.without_xf_facets(), legacy_styles)?;
-            let released = fingerprints.remove(&SCHEMA_VERSION).unwrap_or_default();
-            let mut accepted =
-                builder.current_fingerprints(current_styles, legacy_styles, SCHEMA_VERSION)?;
-            if current_styles.as_written {
-                for reading in [styles, current_styles.without_xf_facets()] {
-                    for fingerprint in
-                        builder.current_fingerprints(reading, legacy_styles, SCHEMA_VERSION)?
-                    {
-                        if !accepted.contains(&fingerprint) {
-                            accepted.push(fingerprint);
+        let ((mut fingerprint, mut bootstrap_client_id), mut fingerprints) =
+            builder.batched(|builder| {
+                let current_styles = if released_styles(&model.styles) {
+                    styles
+                } else {
+                    styles.with_written_fills()
+                };
+                let current = builder.current(current_styles)?;
+                let mut fingerprints =
+                    builder.accepted_fingerprints(styles.without_xf_facets(), legacy_styles)?;
+                let released = fingerprints.remove(&SCHEMA_VERSION).unwrap_or_default();
+                let mut accepted = builder.current_fingerprints(current_styles, legacy_styles)?;
+                if current_styles.as_written {
+                    for reading in [styles, current_styles.without_xf_facets()] {
+                        for fingerprint in builder.current_fingerprints(reading, legacy_styles)? {
+                            if !accepted.contains(&fingerprint) {
+                                accepted.push(fingerprint);
+                            }
                         }
                     }
                 }
-            }
-            for fingerprint in released {
-                if !accepted.contains(&fingerprint) {
-                    accepted.push(fingerprint);
-                }
-            }
-            for version in CHARTS_SCHEMA_VERSION..HIDDEN_SIZE_SCHEMA_VERSION {
-                let mut readings = vec![current_styles];
-                if current_styles.as_written {
-                    readings.extend([styles, current_styles.without_xf_facets()]);
-                }
-                for reading in readings {
-                    for fingerprint in
-                        builder.current_fingerprints(reading, legacy_styles, version)?
-                    {
-                        append_fingerprint(&mut fingerprints, version, fingerprint);
+                for fingerprint in released {
+                    if !accepted.contains(&fingerprint) {
+                        accepted.push(fingerprint);
                     }
                 }
-            }
-            fingerprints.insert(SCHEMA_VERSION, accepted);
-            Ok((current, fingerprints))
-        })?;
+                fingerprints.insert(SCHEMA_VERSION, accepted);
+                Ok((current, fingerprints))
+            })?;
+        retain_hidden_size_fingerprints(
+            model,
+            &mut fingerprint,
+            &mut bootstrap_client_id,
+            &mut fingerprints,
+        );
         Ok(Self {
             bootstrap_client_id,
             date_system: model.date_system,
@@ -282,12 +272,8 @@ impl WorkbookBase {
         let mut accepted = Self::current_fingerprints_oracle(model, legacy_styles)?;
         if !released_styles(&model.styles) {
             for reading in [FingerprintReading::Facets, FingerprintReading::Patterns] {
-                for fingerprint in Self::reading_fingerprints_oracle(
-                    model,
-                    legacy_styles,
-                    reading,
-                    SCHEMA_VERSION,
-                )? {
+                for fingerprint in Self::reading_fingerprints_oracle(model, legacy_styles, reading)?
+                {
                     if !accepted.contains(&fingerprint) {
                         accepted.push(fingerprint);
                     }
@@ -303,25 +289,15 @@ impl WorkbookBase {
                 accepted.push(released);
             }
         }
-        for version in CHARTS_SCHEMA_VERSION..HIDDEN_SIZE_SCHEMA_VERSION {
-            let mut readings = vec![FingerprintReading::of(
-                true,
-                !released_styles(&model.styles),
-            )];
-            if !released_styles(&model.styles) {
-                readings.extend([FingerprintReading::Facets, FingerprintReading::Patterns]);
-            }
-            for reading in readings {
-                for fingerprint in
-                    Self::reading_fingerprints_oracle(model, legacy_styles, reading, version)?
-                {
-                    append_fingerprint(&mut base.fingerprints, version, fingerprint);
-                }
-            }
-        }
         base.fingerprints.insert(SCHEMA_VERSION, accepted);
         base.fingerprint = fingerprint;
         base.bootstrap_client_id = bootstrap_client_id;
+        retain_hidden_size_fingerprints(
+            model,
+            &mut base.fingerprint,
+            &mut base.bootstrap_client_id,
+            &mut base.fingerprints,
+        );
         base.styles = model.styles.clone();
         Ok(base)
     }
@@ -335,7 +311,6 @@ impl WorkbookBase {
             model,
             legacy_styles,
             FingerprintReading::of(true, !released_styles(&model.styles)),
-            SCHEMA_VERSION,
         )
     }
 
@@ -344,7 +319,6 @@ impl WorkbookBase {
         model: &WorkbookModel,
         legacy_styles: Option<&Stylesheet>,
         reading: FingerprintReading,
-        version: i64,
     ) -> Result<Vec<String>, String> {
         let mut accepted = Vec::new();
         for (include_col_styles, include_row_styles) in
@@ -355,11 +329,11 @@ impl WorkbookBase {
             for reading in std::iter::once(current).chain(current.legacy()) {
                 let (fingerprint, _) = fingerprint_model_with_row_domain_oracle(
                     model,
-                    version,
+                    SCHEMA_VERSION,
                     true,
                     include_col_styles,
                     include_row_styles,
-                    fingerprint_domain(version, reading),
+                    fingerprint_domain(SCHEMA_VERSION, reading),
                 )?;
                 accepted.push(fingerprint);
             }
@@ -371,14 +345,13 @@ impl WorkbookBase {
                 &legacy_model,
                 None,
                 reading,
-                version,
             )?);
         }
         if !model.styles.indexed_colors.is_empty() {
             let mut legacy_model = model.clone();
             legacy_model.styles.indexed_colors.clear();
             let colorless =
-                Self::reading_fingerprints_oracle(&legacy_model, legacy_styles, reading, version)?;
+                Self::reading_fingerprints_oracle(&legacy_model, legacy_styles, reading)?;
             accepted.extend(colorless);
         }
         let mut unique = Vec::new();
@@ -611,8 +584,6 @@ struct SheetSharedTypes {
     sheet: BranchID,
     col_widths: BranchID,
     contents: BranchID,
-    hidden_col_widths: Option<BranchID>,
-    hidden_row_heights: Option<BranchID>,
     row_heights: BranchID,
     styles: BranchID,
 }
@@ -1891,10 +1862,8 @@ impl WorkbookAuthority {
                 sync_numbers(&widths, &mut txn, col_widths);
                 let heights: MapRef = sheet.get_or_init(&mut txn, ROW_HEIGHTS);
                 sync_numbers(&heights, &mut txn, row_heights);
-                let hidden_widths: MapRef = sheet.get_or_init(&mut txn, HIDDEN_COL_WIDTHS);
-                sync_numbers(&hidden_widths, &mut txn, hidden_col_widths);
-                let hidden_heights: MapRef = sheet.get_or_init(&mut txn, HIDDEN_ROW_HEIGHTS);
-                sync_numbers(&hidden_heights, &mut txn, hidden_row_heights);
+                sync_optional_numbers(&sheet, &mut txn, HIDDEN_COL_WIDTHS, hidden_col_widths);
+                sync_optional_numbers(&sheet, &mut txn, HIDDEN_ROW_HEIGHTS, hidden_row_heights);
             }
             let (freeze_pane, hyperlinks, charts) = features
                 .get(&key)
@@ -3548,7 +3517,6 @@ fn sync_sheet_with_style_key(
     style_key: impl Fn(u32) -> Result<String, String>,
 ) -> Result<(), String> {
     let col_widths: MapRef = sheet_map.get_or_init(txn, COL_WIDTHS);
-    let hidden_col_widths: MapRef = sheet_map.get_or_init(txn, HIDDEN_COL_WIDTHS);
     let contents: MapRef = sheet_map.get_or_init(txn, CONTENTS);
     if !sheet.row_styles.is_empty() || sheet_map.get(txn, ROW_STYLES).is_some() {
         let rows = sheet
@@ -3580,13 +3548,17 @@ fn sync_sheet_with_style_key(
     sheet_map.try_update(txn, MERGES, merges_to_any(&sheet.merges));
     sheet_map.try_update(txn, NAME, sheet.name.as_str());
     let row_heights: MapRef = sheet_map.get_or_init(txn, ROW_HEIGHTS);
-    let hidden_row_heights: MapRef = sheet_map.get_or_init(txn, HIDDEN_ROW_HEIGHTS);
     let styles: MapRef = sheet_map.get_or_init(txn, STYLES);
     sync_numbers(&col_widths, txn, &sheet.col_widths);
-    sync_numbers(&hidden_col_widths, txn, &sheet.hidden_col_widths);
+    sync_optional_numbers(sheet_map, txn, HIDDEN_COL_WIDTHS, &sheet.hidden_col_widths);
     sync_contents(&contents, txn, sheet);
     sync_numbers(&row_heights, txn, &sheet.row_heights);
-    sync_numbers(&hidden_row_heights, txn, &sheet.hidden_row_heights);
+    sync_optional_numbers(
+        sheet_map,
+        txn,
+        HIDDEN_ROW_HEIGHTS,
+        &sheet.hidden_row_heights,
+    );
     sync_styles(&styles, txn, sheet, style_key)?;
     Ok(())
 }
@@ -4031,6 +4003,18 @@ fn sync_optional(map: &MapRef, txn: &mut TransactionMut<'_>, key: &str, value: O
     }
 }
 
+fn sync_optional_numbers(
+    sheet: &MapRef,
+    txn: &mut TransactionMut<'_>,
+    field: &str,
+    values: &BTreeMap<u32, f64>,
+) {
+    if !values.is_empty() || sheet.get(txn, field).is_some() {
+        let map: MapRef = sheet.get_or_init(txn, field);
+        sync_numbers(&map, txn, values);
+    }
+}
+
 fn sync_numbers(map: &MapRef, txn: &mut TransactionMut<'_>, values: &BTreeMap<u32, f64>) {
     let retained = values.keys().map(u32::to_string).collect::<HashSet<_>>();
     let mut stale = map
@@ -4148,41 +4132,22 @@ fn materialize_sheet<T: ReadTxn>(
             }
         }
     }
-    if version >= HIDDEN_SIZE_SCHEMA_VERSION {
-        sheet.hidden_col_widths = materialize_numbers(
-            &nested_map(sheet_map, txn, HIDDEN_COL_WIDTHS)?,
-            txn,
-            MAX_COLS,
-            "hidden column width",
-        )?;
-        sheet.hidden_row_heights = materialize_numbers(
-            &nested_map(sheet_map, txn, HIDDEN_ROW_HEIGHTS)?,
-            txn,
-            MAX_ROWS,
-            "hidden row height",
-        )?;
-        sheet
-            .hidden_col_widths
-            .retain(|index, _| sheet.col_widths.get(index) == Some(&0.0));
-        sheet
-            .hidden_row_heights
-            .retain(|index, _| sheet.row_heights.get(index) == Some(&0.0));
-    } else {
-        sheet.hidden_col_widths = fallbacks
-            .hidden_dimensions
-            .col_widths
-            .iter()
-            .filter(|(index, size)| **size > 0.0 && sheet.col_widths.get(*index) == Some(&0.0))
-            .map(|(index, size)| (*index, *size))
-            .collect();
-        sheet.hidden_row_heights = fallbacks
-            .hidden_dimensions
-            .row_heights
-            .iter()
-            .filter(|(index, size)| **size > 0.0 && sheet.row_heights.get(*index) == Some(&0.0))
-            .map(|(index, size)| (*index, *size))
-            .collect();
-    }
+    sheet.hidden_col_widths = materialize_hidden_sizes(
+        sheet_map,
+        txn,
+        HIDDEN_COL_WIDTHS,
+        MAX_COLS,
+        &sheet.col_widths,
+        &fallbacks.hidden_dimensions.col_widths,
+    )?;
+    sheet.hidden_row_heights = materialize_hidden_sizes(
+        sheet_map,
+        txn,
+        HIDDEN_ROW_HEIGHTS,
+        MAX_ROWS,
+        &sheet.row_heights,
+        &fallbacks.hidden_dimensions.row_heights,
+    )?;
     sheet.format = fallbacks.format;
     sheet.col_styles = fallbacks.col_styles.to_vec();
     sheet.row_styles = fallbacks.row_styles.clone();
@@ -4260,17 +4225,31 @@ fn sheet_shared_types<T: ReadTxn>(sheet_map: &MapRef, txn: &T) -> Result<SheetSh
         sheet: sheet_map.as_ref().id(),
         col_widths: nested_map(sheet_map, txn, COL_WIDTHS)?.as_ref().id(),
         contents: nested_map(sheet_map, txn, CONTENTS)?.as_ref().id(),
-        hidden_col_widths: sheet_map
-            .get(txn, HIDDEN_COL_WIDTHS)
-            .and_then(|value| value.cast::<MapRef>().ok())
-            .map(|map| map.as_ref().id()),
-        hidden_row_heights: sheet_map
-            .get(txn, HIDDEN_ROW_HEIGHTS)
-            .and_then(|value| value.cast::<MapRef>().ok())
-            .map(|map| map.as_ref().id()),
         row_heights: nested_map(sheet_map, txn, ROW_HEIGHTS)?.as_ref().id(),
         styles: nested_map(sheet_map, txn, STYLES)?.as_ref().id(),
     })
+}
+
+fn materialize_hidden_sizes<T: ReadTxn>(
+    sheet: &MapRef,
+    txn: &T,
+    field: &str,
+    limit: u32,
+    visible: &BTreeMap<u32, f64>,
+    fallback: &BTreeMap<u32, f64>,
+) -> Result<BTreeMap<u32, f64>, String> {
+    let values = match sheet.get(txn, field) {
+        Some(_) => materialize_numbers(&nested_map(sheet, txn, field)?, txn, limit, field)?,
+        None => fallback
+            .iter()
+            .filter(|(_, size)| **size > 0.0)
+            .map(|(&index, &size)| (index, size))
+            .collect(),
+    };
+    Ok(values
+        .into_iter()
+        .filter(|(index, _)| visible.get(index) == Some(&0.0))
+        .collect())
 }
 
 fn materialize_numbers<T: ReadTxn>(
@@ -4364,24 +4343,11 @@ fn sheet_schema_keys(version: i64) -> &'static [&'static str] {
         ROW_HEIGHTS,
         STYLES,
     ];
-    const V7: &[&str] = &[
-        COL_WIDTHS,
-        CONTENTS,
-        FREEZE_PANE,
-        HIDDEN_COL_WIDTHS,
-        HIDDEN_ROW_HEIGHTS,
-        HYPERLINKS,
-        MERGES,
-        NAME,
-        ROW_HEIGHTS,
-        STYLES,
-    ];
     match version {
         MIN_SUPPORTED_SCHEMA_VERSION => V3,
         FREEZE_PANE_SCHEMA_VERSION => V4,
         HYPERLINK_SCHEMA_VERSION => V5,
-        CHARTS_SCHEMA_VERSION => V6,
-        _ => V7,
+        _ => V6,
     }
 }
 
@@ -4390,8 +4356,14 @@ fn sheet_schema_keys(version: i64) -> &'static [&'static str] {
 /// deletes the key outright, so it reads as absent and falls back to what the
 /// source package holds rather than failing the whole workbook.
 fn sheet_schema_optional_keys(version: i64) -> &'static [&'static str] {
-    const NONE: &[&str] = &[];
-    const V6: &[&str] = &[CHARTS, ROW_STYLES, COL_STYLES];
+    const NONE: &[&str] = &[HIDDEN_COL_WIDTHS, HIDDEN_ROW_HEIGHTS];
+    const V6: &[&str] = &[
+        CHARTS,
+        ROW_STYLES,
+        COL_STYLES,
+        HIDDEN_COL_WIDTHS,
+        HIDDEN_ROW_HEIGHTS,
+    ];
     if version >= CHARTS_SCHEMA_VERSION {
         V6
     } else {
@@ -5321,12 +5293,11 @@ impl<'a> FingerprintBuilder<'a> {
         &mut self,
         styles: FingerprintStyles<'a>,
         legacy_styles: Option<&'a Stylesheet>,
-        version: i64,
     ) -> Result<Vec<String>, String> {
         let mut accepted = Vec::new();
         let mut readings = Vec::new();
         for (columns, rows) in [(true, true), (false, false), (true, false)] {
-            let (current, _) = self.hash(styles, version, true, columns, rows, false)?;
+            let (current, _) = self.hash(styles, SCHEMA_VERSION, true, columns, rows, false)?;
             if !accepted.contains(&current) {
                 accepted.push(current);
             }
@@ -5336,7 +5307,7 @@ impl<'a> FingerprintBuilder<'a> {
                 .legacy()
             {
                 let (fingerprint, _) =
-                    self.hash_as(styles, version, true, (columns, rows, false), legacy)?;
+                    self.hash_as(styles, SCHEMA_VERSION, true, (columns, rows, false), legacy)?;
                 if !accepted.contains(&fingerprint) {
                     accepted.push(fingerprint);
                 }
@@ -5351,11 +5322,11 @@ impl<'a> FingerprintBuilder<'a> {
             })
             .filter(|legacy| *legacy != styles)
         {
-            readings.extend(self.current_fingerprints(legacy, None, version)?);
+            readings.extend(self.current_fingerprints(legacy, None)?);
         }
         if !styles.indexed_colors.is_empty() {
             let colorless =
-                self.current_fingerprints(styles.without_indexed_colors(), legacy_styles, version)?;
+                self.current_fingerprints(styles.without_indexed_colors(), legacy_styles)?;
             readings.extend(colorless);
         }
         for fingerprint in readings {
@@ -5722,18 +5693,6 @@ fn fingerprint_model(
                 hash_u32(hasher, row);
                 hash_u64(hasher, height.to_bits());
             }
-            if spec.schema_version >= HIDDEN_SIZE_SCHEMA_VERSION {
-                hash_u64(hasher, sheet.hidden_col_widths.len() as u64);
-                for (&column, &width) in &sheet.hidden_col_widths {
-                    hash_u32(hasher, column);
-                    hash_u64(hasher, width.to_bits());
-                }
-                hash_u64(hasher, sheet.hidden_row_heights.len() as u64);
-                for (&row, &height) in &sheet.hidden_row_heights {
-                    hash_u32(hasher, row);
-                    hash_u64(hasher, height.to_bits());
-                }
-            }
             if spec.schema_version >= FREEZE_PANE_SCHEMA_VERSION {
                 match sheet.freeze_pane {
                     Some(pane) => {
@@ -5777,6 +5736,54 @@ fn fingerprint_model(
             (fingerprint, client)
         })
         .collect())
+}
+
+fn retain_hidden_size_fingerprints(
+    model: &WorkbookModel,
+    fingerprint: &mut String,
+    bootstrap_client_id: &mut u64,
+    fingerprints: &mut BTreeMap<i64, Vec<String>>,
+) {
+    if model
+        .sheets
+        .iter()
+        .all(|sheet| sheet.hidden_col_widths.is_empty() && sheet.hidden_row_heights.is_empty())
+    {
+        return;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"betteroffice-xlsx-hidden-sizes");
+    hash_u64(&mut hasher, model.sheets.len() as u64);
+    for sheet in &model.sheets {
+        for sizes in [&sheet.hidden_col_widths, &sheet.hidden_row_heights] {
+            hash_u64(&mut hasher, sizes.len() as u64);
+            for (&index, &size) in sizes {
+                hash_u32(&mut hasher, index);
+                hash_u64(&mut hasher, size.to_bits());
+            }
+        }
+    }
+    let sizes = hasher.finalize();
+    let retained = |fingerprint: &str| {
+        let mut hasher = Sha256::new();
+        hasher.update(sizes);
+        hash_bytes(&mut hasher, fingerprint.as_bytes());
+        fingerprint_text(
+            fingerprint_reading(fingerprint),
+            format!("{:x}", hasher.finalize()),
+        )
+    };
+    if let Some(accepted) = fingerprints.get_mut(&SCHEMA_VERSION) {
+        accepted.extend(
+            accepted
+                .clone()
+                .iter()
+                .map(|fingerprint| retained(fingerprint)),
+        );
+    }
+    *fingerprint = retained(fingerprint);
+    *bootstrap_client_id =
+        fingerprint_client_id(fingerprint).expect("retained-size fingerprint is a tagged digest");
 }
 
 fn client_id_of_digest(head: u64) -> u64 {
@@ -6161,41 +6168,22 @@ fn materialize_sheet_oracle<T: ReadTxn>(
             }
         }
     }
-    if version >= HIDDEN_SIZE_SCHEMA_VERSION {
-        sheet.hidden_col_widths = materialize_numbers(
-            &nested_map(sheet_map, txn, HIDDEN_COL_WIDTHS)?,
-            txn,
-            MAX_COLS,
-            "hidden column width",
-        )?;
-        sheet.hidden_row_heights = materialize_numbers(
-            &nested_map(sheet_map, txn, HIDDEN_ROW_HEIGHTS)?,
-            txn,
-            MAX_ROWS,
-            "hidden row height",
-        )?;
-        sheet
-            .hidden_col_widths
-            .retain(|index, _| sheet.col_widths.get(index) == Some(&0.0));
-        sheet
-            .hidden_row_heights
-            .retain(|index, _| sheet.row_heights.get(index) == Some(&0.0));
-    } else {
-        sheet.hidden_col_widths = fallbacks
-            .hidden_dimensions
-            .col_widths
-            .iter()
-            .filter(|(index, size)| **size > 0.0 && sheet.col_widths.get(*index) == Some(&0.0))
-            .map(|(index, size)| (*index, *size))
-            .collect();
-        sheet.hidden_row_heights = fallbacks
-            .hidden_dimensions
-            .row_heights
-            .iter()
-            .filter(|(index, size)| **size > 0.0 && sheet.row_heights.get(*index) == Some(&0.0))
-            .map(|(index, size)| (*index, *size))
-            .collect();
-    }
+    sheet.hidden_col_widths = materialize_hidden_sizes(
+        sheet_map,
+        txn,
+        HIDDEN_COL_WIDTHS,
+        MAX_COLS,
+        &sheet.col_widths,
+        &fallbacks.hidden_dimensions.col_widths,
+    )?;
+    sheet.hidden_row_heights = materialize_hidden_sizes(
+        sheet_map,
+        txn,
+        HIDDEN_ROW_HEIGHTS,
+        MAX_ROWS,
+        &sheet.row_heights,
+        &fallbacks.hidden_dimensions.row_heights,
+    )?;
     sheet.format = fallbacks.format;
     sheet.col_styles = fallbacks.col_styles.to_vec();
     sheet.row_styles = fallbacks.row_styles.clone();
@@ -6419,18 +6407,6 @@ fn fingerprint_model_with_row_domain_oracle(
         for (&row, &height) in &sheet.row_heights {
             hash_u32(&mut hasher, row);
             hash_u64(&mut hasher, height.to_bits());
-        }
-        if schema_version >= HIDDEN_SIZE_SCHEMA_VERSION {
-            hash_u64(&mut hasher, sheet.hidden_col_widths.len() as u64);
-            for (&column, &width) in &sheet.hidden_col_widths {
-                hash_u32(&mut hasher, column);
-                hash_u64(&mut hasher, width.to_bits());
-            }
-            hash_u64(&mut hasher, sheet.hidden_row_heights.len() as u64);
-            for (&row, &height) in &sheet.hidden_row_heights {
-                hash_u32(&mut hasher, row);
-                hash_u64(&mut hasher, height.to_bits());
-            }
         }
         if schema_version >= FREEZE_PANE_SCHEMA_VERSION {
             match sheet.freeze_pane {
@@ -7380,10 +7356,8 @@ mod tests {
                 if version < FREEZE_PANE_SCHEMA_VERSION {
                     sheet.remove(&mut txn, FREEZE_PANE);
                 }
-                if version < HIDDEN_SIZE_SCHEMA_VERSION {
-                    sheet.remove(&mut txn, HIDDEN_COL_WIDTHS);
-                    sheet.remove(&mut txn, HIDDEN_ROW_HEIGHTS);
-                }
+                sheet.remove(&mut txn, HIDDEN_COL_WIDTHS);
+                sheet.remove(&mut txn, HIDDEN_ROW_HEIGHTS);
             }
         }
         doc.transact()
@@ -7847,6 +7821,46 @@ mod tests {
     }
 
     #[test]
+    fn optional_hidden_sizes_keep_schema_six_identity_and_restore_source_sizes() {
+        let mut model = rich_model();
+        model.sheets[0].col_widths.insert(1, 0.0);
+        model.sheets[0].hidden_col_widths.insert(1, 20.0);
+        model.sheets[0].row_heights.insert(2, 0.0);
+        model.sheets[0].hidden_row_heights.insert(2, 30.0);
+        let authority = WorkbookAuthority::from_model_with_client_id(&model, 11).unwrap();
+        let mut changed = model.clone();
+        changed.sheets[0].hidden_col_widths.insert(1, 25.0);
+        let changed = WorkbookAuthority::from_model_with_client_id(&changed, 12).unwrap();
+        assert_ne!(authority.base.fingerprint, changed.base.fingerprint);
+        assert_ne!(
+            authority.base.bootstrap_client_id,
+            changed.base.bootstrap_client_id
+        );
+        let update = legacy_update(&model, 6, true);
+        let restored = authority_from_update(&model, &update, 13);
+        assert_eq!(restored.schema_version().unwrap(), 6);
+        assert_eq!(restored.strict_materialize().unwrap().0, model);
+        let txn = restored.doc.transact();
+        let sheets = txn.get_map(SHEETS).unwrap();
+        let sheet = sheets
+            .get(&txn, "sheet:0")
+            .unwrap()
+            .cast::<MapRef>()
+            .unwrap();
+        assert!(sheet.get(&txn, HIDDEN_COL_WIDTHS).is_none());
+        assert!(sheet.get(&txn, HIDDEN_ROW_HEIGHTS).is_none());
+        drop(txn);
+        {
+            let mut txn = restored.doc.transact_mut();
+            let _: MapRef = sheet.get_or_init(&mut txn, HIDDEN_COL_WIDTHS);
+            let _: MapRef = sheet.get_or_init(&mut txn, HIDDEN_ROW_HEIGHTS);
+        }
+        model.sheets[0].hidden_col_widths.clear();
+        model.sheets[0].hidden_row_heights.clear();
+        assert_eq!(restored.strict_materialize().unwrap().0, model);
+    }
+
+    #[test]
     fn known_schema_versions_materialize_and_upgrade_to_current() {
         let model = rich_model();
         for (index, (version, include_defined_names)) in
@@ -8042,7 +8056,7 @@ mod tests {
         };
         assert_eq!(
             error,
-            "unsupported schema version 8; supported versions are 3 through 7"
+            "unsupported schema version 7; supported versions are 3 through 6"
         );
     }
 

@@ -777,6 +777,24 @@ impl SnapshotValidation {
                     }
                     self.sheet_keys.insert(self.sheet, key.clone());
                     self.sheet_indices.insert(key, self.sheet);
+                    let hidden_maps = [HIDDEN_COL_WIDTHS, HIDDEN_ROW_HEIGHTS].map(|field| {
+                        map.get(&txn, field)
+                            .map(|_| nested_map(&map, &txn, field).map(|child| (field, child)))
+                            .transpose()
+                    });
+                    let [widths, heights] = hidden_maps;
+                    let widths = widths.map_err(SnapshotError::new)?;
+                    let heights = heights.map_err(SnapshotError::new)?;
+                    augment(
+                        self.unit_bytes
+                            + 128
+                                * (usize::from(widths.is_some()) + usize::from(heights.is_some())),
+                        budget,
+                        &mut self.unit_bytes,
+                    )?;
+                    for (field, child) in widths.into_iter().chain(heights) {
+                        self.maps.insert(parent(&child), (self.sheet, field));
+                    }
                     self.maps.insert(parent(&map), (self.sheet, "sheet"));
                     self.field += 1;
                     return Ok(false);
@@ -1440,6 +1458,12 @@ impl SnapshotValidation {
                     }
                     return Ok(false);
                 }
+                if self.field == 2 && sheet.hidden_col_widths.is_empty() {
+                    self.field += 1;
+                }
+                if self.field == 3 && sheet.hidden_row_heights.is_empty() {
+                    self.field += 1;
+                }
                 if self.field < 4 {
                     let dimensions = match self.field {
                         0 => &sheet.col_widths,
@@ -1459,18 +1483,18 @@ impl SnapshotValidation {
                             2 => HIDDEN_COL_WIDTHS,
                             _ => HIDDEN_ROW_HEIGHTS,
                         };
-                        let actual = if self.field < 2 || self.version >= HIDDEN_SIZE_SCHEMA_VERSION
-                        {
-                            nested_map(&map, &txn, field)
-                                .map_err(SnapshotError::new)?
-                                .get(&txn, &index.to_string())
-                                .and_then(|value| value.cast::<f64>().ok())
-                        } else {
-                            None
-                        };
+                        let child = map
+                            .get(&txn, field)
+                            .map(|_| nested_map(&map, &txn, field))
+                            .transpose()
+                            .map_err(SnapshotError::new)?;
+                        let actual = child
+                            .as_ref()
+                            .and_then(|child| child.get(&txn, &index.to_string()))
+                            .and_then(|value| value.cast::<f64>().ok());
                         let fallback = if (self.field < 2
                             && self.version < HIDDEN_DIMENSIONS_SCHEMA_VERSION)
-                            || (self.field >= 2 && self.version < HIDDEN_SIZE_SCHEMA_VERSION)
+                            || (self.field >= 2 && child.is_none())
                         {
                             base.hidden_dimensions
                                 .get(

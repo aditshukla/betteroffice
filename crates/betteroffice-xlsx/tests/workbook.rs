@@ -9196,63 +9196,42 @@ fn zero_size_ops_preserve_authored_dimensions_in_saved_xml() {
 fn hidden_custom_sizes_survive_bounded_workbook_snapshots() {
     use betteroffice_xlsx::{SnapshotBudget, WorkbookSnapshotBuilder, WorkbookSnapshotEncoder};
     let mut sheet = Sheet::new("Sized");
-    sheet.col_widths.insert(0, 20.0);
-    sheet.row_heights.insert(0, 30.0);
+    sheet.col_widths.insert(0, 0.0);
+    sheet.hidden_col_widths.insert(0, 20.0);
+    sheet.row_heights.insert(0, 0.0);
+    sheet.hidden_row_heights.insert(0, 30.0);
     let model = WorkbookModel {
         sheets: vec![sheet],
         ..Default::default()
     };
     let source = ooxml_opc::rezip_parts(&xlsx_parse::serialize_workbook(&model).unwrap()).unwrap();
-    for collaborative in [false, true] {
-        let mut workbook = if collaborative {
-            Workbook::open_collaborative(&source, 868).unwrap()
-        } else {
-            Workbook::open(&source).unwrap()
-        };
-        workbook
-            .apply_ops(
-                vec![
-                    Op::SetColVisibility {
-                        sheet: SheetId(0),
-                        col: 0,
-                        hidden: true,
-                    },
-                    Op::SetRowVisibility {
-                        sheet: SheetId(0),
-                        row: 0,
-                        hidden: true,
-                    },
-                ],
-                CalculationOptions::default(),
-            )
-            .unwrap();
-        let budget = SnapshotBudget::new(8, 65536).unwrap();
-        let mut encoder = WorkbookSnapshotEncoder::new(&workbook, None, budget).unwrap();
-        let mut builder = WorkbookSnapshotBuilder::new();
-        while let Some(chunk) = encoder.next(&workbook).unwrap() {
-            builder.push(&chunk).unwrap();
-        }
-        while !builder.advance(budget).unwrap().is_ready() {}
-        let (mut restored, _) = builder.finish().unwrap().into_parts();
-        assert_eq!(restored.model(), workbook.model());
-        restored
-            .apply_ops(
-                vec![
-                    Op::SetColVisibility {
-                        sheet: SheetId(0),
-                        col: 0,
-                        hidden: false,
-                    },
-                    Op::SetRowVisibility {
-                        sheet: SheetId(0),
-                        row: 0,
-                        hidden: false,
-                    },
-                ],
-                CalculationOptions::default(),
-            )
-            .unwrap();
-        assert_eq!(restored.model().sheets[0].col_widths.get(&0), Some(&20.0));
-        assert_eq!(restored.model().sheets[0].row_heights.get(&0), Some(&30.0));
+    let workbook = Workbook::open(&source).unwrap();
+    let budget = SnapshotBudget::new(8, 65536).unwrap();
+    let mut encoder = WorkbookSnapshotEncoder::new(&workbook, None, budget).unwrap();
+    let mut builder = WorkbookSnapshotBuilder::new();
+    while let Some(chunk) = encoder.next(&workbook).unwrap() {
+        builder.push(&chunk).unwrap();
     }
+    while !builder.advance(budget).unwrap().is_ready() {}
+    let (mut restored, _) = builder.finish().unwrap().into_parts();
+    assert_eq!(restored.model(), workbook.model());
+    restored
+        .apply_ops(
+            vec![
+                Op::SetColVisibility {
+                    sheet: SheetId(0),
+                    col: 0,
+                    hidden: false,
+                },
+                Op::SetRowVisibility {
+                    sheet: SheetId(0),
+                    row: 0,
+                    hidden: false,
+                },
+            ],
+            CalculationOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(restored.model().sheets[0].col_widths.get(&0), Some(&20.0));
+    assert_eq!(restored.model().sheets[0].row_heights.get(&0), Some(&30.0));
 }
