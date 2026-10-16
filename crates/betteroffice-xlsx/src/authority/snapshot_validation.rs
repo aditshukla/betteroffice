@@ -139,7 +139,10 @@ mod pattern_tests {
                 .unwrap()
         };
         let mut keys = SnapshotKeys::new();
-        for (range, target) in [("A1", "https://example.com".into()), ("B1", "x".repeat(512))] {
+        for (range, target) in [
+            ("A1", "https://example.com".into()),
+            ("B1", "x".repeat(512)),
+        ] {
             let mut link = hyperlinks::hyperlink_metadata(CellRange::parse_a1(range).unwrap());
             link.external_target = Some(target);
             let json = serde_json::to_string(&link).unwrap();
