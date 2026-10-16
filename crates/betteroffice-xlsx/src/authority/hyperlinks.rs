@@ -42,6 +42,18 @@ pub(super) fn insert_hyperlink_edit(
                 return Err(format!("hyperlink edit {key} is not one link"));
             }
             let link = parsed.pop().unwrap();
+            if [
+                &link.external_target,
+                &link.location,
+                &link.tooltip,
+                &link.display,
+            ]
+            .into_iter()
+            .flatten()
+            .any(String::is_empty)
+            {
+                return Err("sheet hyperlink field must not be empty".to_string());
+            }
             if link.range != range || link.range.to_a1() != range_key {
                 return Err(format!("hyperlink edit {key} has a different range"));
             }
@@ -50,6 +62,16 @@ pub(super) fn insert_hyperlink_edit(
         _ => return Err(format!("hyperlink edit {key} is not a link or removal")),
     };
     edits.insert(range_key.to_string(), link);
+    Ok(())
+}
+
+pub(crate) fn validate_hyperlink_edit_baseline(links: &[Hyperlink]) -> Result<(), String> {
+    if links.iter().any(|link| {
+        let range = link.range;
+        range.start.abs_row || range.start.abs_col || range.end.abs_row || range.end.abs_col
+    }) {
+        return Err("cannot edit anchored imported hyperlinks".to_string());
+    }
     Ok(())
 }
 
@@ -74,6 +96,7 @@ pub(super) fn sync_hyperlinks(
         return Err("sheet is missing hyperlinks".to_string());
     };
     let baseline = decode_hyperlinks(&json)?;
+    validate_hyperlink_edit_baseline(&baseline)?;
     let mut occupied = MergeIndex::default();
     for link in &baseline {
         if occupied.overlaps(1, 0, MAX_COLS - 1, &link.range) {
@@ -161,6 +184,7 @@ impl HyperlinkProjection {
         if !self.changed {
             return Ok(Some(link));
         }
+        validate_hyperlink_edit_baseline(std::slice::from_ref(&link))?;
         if self
             .baseline_occupied
             .overlaps(1, 0, MAX_COLS - 1, &link.range)
@@ -199,6 +223,7 @@ pub(super) fn hyperlink_metadata(range: CellRange) -> Hyperlink {
 
 #[derive(Default)]
 pub(super) struct HyperlinkJson {
+    baseline: bool,
     offset: usize,
     range: Option<CellRange>,
     field: usize,
@@ -233,10 +258,11 @@ impl HyperlinkJson {
                 || range.start.col > range.end.col
                 || range.end.row >= MAX_ROWS
                 || range.end.col >= MAX_COLS
-                || range.start.abs_row
-                || range.start.abs_col
-                || range.end.abs_row
-                || range.end.abs_col
+                || !self.baseline
+                    && (range.start.abs_row
+                        || range.start.abs_col
+                        || range.end.abs_row
+                        || range.end.abs_col)
                 || serde_json::to_string(&range).map_err(|_| invalid())? != remaining[..end]
             {
                 return Err(invalid());
@@ -279,10 +305,10 @@ impl HyperlinkJson {
         while self.offset < end {
             let byte = bytes[self.offset];
             if byte == b'"' {
-                if self.field_bytes == 0 {
+                if !self.baseline && self.field_bytes == 0 {
                     return Err("sheet hyperlink field must not be empty".to_string());
                 }
-                self.destination |= self.field < 2;
+                self.destination |= self.field < 2 && self.field_bytes != 0;
                 self.offset += 1;
                 self.field += 1;
                 self.in_string = false;
@@ -383,7 +409,10 @@ impl HyperlinkBaseline {
             if self.count >= MAX_HYPERLINKS_PER_SHEET {
                 return Err("sheet has too many hyperlinks".to_string());
             }
-            self.value = Some(HyperlinkJson::default());
+            self.value = Some(HyperlinkJson {
+                baseline: true,
+                ..HyperlinkJson::default()
+            });
             return Ok(HyperlinkRead::Pending);
         }
         let value = self.value.as_mut().unwrap();

@@ -39,6 +39,7 @@ mod merges;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod snapshot;
 pub(crate) mod snapshot_validation;
+pub(crate) use hyperlinks::validate_hyperlink_edit_baseline;
 use hyperlinks::{
     HYPERLINK_PREFIX, HyperlinkBaseline, HyperlinkEdits, HyperlinkProjection,
     clear_hyperlink_edits, insert_hyperlink_edit, project_hyperlinks, sync_hyperlinks,
@@ -8535,7 +8536,9 @@ mod tests {
             )
             .unwrap();
         let update = current.encode_diff_v1(&before_vector).unwrap();
-        let result = with_schema_six_key_validation(|| old.apply_update_v1(&update, options));
+        SCHEMA_SIX_KEY_VALIDATION.set(true);
+        let result = old.apply_update_v1(&update, options);
+        SCHEMA_SIX_KEY_VALIDATION.set(false);
         let error = result.unwrap_err().to_string();
         assert!(
             error.contains("sheet sheet:0 keys do not match the schema"),
@@ -9049,7 +9052,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_six_key_validation_resets_after_unwinding() {
+    fn hyperlink_schema_six_key_validation_resets_after_unwinding() {
         assert!(!SCHEMA_SIX_KEY_VALIDATION.get());
         let result = catch_unwind(|| {
             with_schema_six_key_validation(|| {
@@ -9078,14 +9081,11 @@ mod tests {
                 .insert("unknown".into(), serde_json::Value::Bool(true));
             let mut omitted = serde_json::to_value(&link).unwrap();
             omitted.as_object_mut().unwrap().remove("tooltip");
-            let mut anchored = link;
-            anchored.range = CellRange::parse_a1("$A$1").unwrap();
             for json in [
                 format!(" {canonical}"),
                 canonical.replace("null", " null"),
                 serde_json::to_string(&[extra]).unwrap(),
                 serde_json::to_string(&[omitted]).unwrap(),
-                serde_json::to_string(&[anchored]).unwrap(),
             ] {
                 let mut model = WorkbookModel::default();
                 model.sheets.push(Sheet::new("Data"));
@@ -9139,22 +9139,116 @@ mod tests {
     }
 
     #[test]
-    fn empty_optional_hyperlink_fields_are_refused_in_peer_state() {
+    fn empty_optional_hyperlink_fields_are_accepted_only_in_baselines() {
         for baseline in [false, true] {
-            for field in 0..4 {
-                let mut model = WorkbookModel::default();
-                model.sheets.push(Sheet::new("Data"));
-                let authority = WorkbookAuthority::from_model_with_client_id(&model, 262).unwrap();
-                let mut link = test_hyperlink("A1", "Data!A1");
-                link.external_target = Some("https://example.com".into());
-                match field {
-                    0 => link.external_target = Some(String::new()),
-                    1 => link.location = Some(String::new()),
-                    2 => link.tooltip = Some(String::new()),
-                    _ => link.display = Some(String::new()),
+            for long in [false, true] {
+                for field in 0..4 {
+                    let mut model = WorkbookModel::default();
+                    model.sheets.push(Sheet::new("Data"));
+                    let authority =
+                        WorkbookAuthority::from_model_with_client_id(&model, 262).unwrap();
+                    let mut link = test_hyperlink("A1", "Data!A1");
+                    link.external_target = Some("https://example.com".into());
+                    if long {
+                        link.tooltip = Some("a".repeat(300));
+                        link.display = Some("b".repeat(300));
+                    }
+                    match field {
+                        0 => link.external_target = Some(String::new()),
+                        1 => link.location = Some(String::new()),
+                        2 => link.tooltip = Some(String::new()),
+                        _ => link.display = Some(String::new()),
+                    }
+                    {
+                        let mut txn = authority.doc.transact_mut();
+                        let sheet = txn
+                            .get_map(SHEETS)
+                            .unwrap()
+                            .get(&txn, "sheet:0")
+                            .unwrap()
+                            .cast::<MapRef>()
+                            .unwrap();
+                        if baseline {
+                            sheet.try_update(
+                                &mut txn,
+                                HYPERLINKS,
+                                serde_json::to_string(std::slice::from_ref(&link)).unwrap(),
+                            );
+                        } else {
+                            sheet.try_update(
+                                &mut txn,
+                                "hyperlink:A1",
+                                serde_json::to_string(&link).unwrap(),
+                            );
+                        }
+                    }
+                    if baseline {
+                        model.sheets[0].hyperlinks = vec![link];
+                        assert_eq!(authority.strict_materialize().unwrap().0, model);
+                        snapshot_validation::validate_for_test(&authority, model).unwrap();
+                    } else {
+                        assert!(authority.strict_materialize().is_err());
+                        assert!(snapshot_validation::validate_for_test(&authority, model).is_err());
+                    }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn imported_empty_hyperlink_fields_validate_through_edit_undo_and_redo() {
+        let mut model = WorkbookModel::default();
+        model.sheets.push(Sheet::new("Data"));
+        let mut parts = xlsx_parse::serialize_workbook(&model).unwrap();
+        parts
+            .iter_mut()
+            .find(|(name, _)| name == "xl/worksheets/sheet1.xml")
+            .unwrap()
+            .1 =
+            br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/><hyperlinks><hyperlink ref="A1" location="Data!D1" tooltip="" display=""/></hyperlinks></worksheet>"#.to_vec();
+        let bytes = ooxml_opc::rezip_parts(&parts).unwrap();
+        let mut workbook = crate::Workbook::open_collaborative(&bytes, 264).unwrap();
+        let base = Arc::new(WorkbookBase::from_model(workbook.model()).unwrap());
+        let options = crate::CalculationOptions::default();
+        for step in 0..4 {
+            match step {
+                1 => {
+                    workbook
+                        .set_hyperlink(SheetId(0), test_hyperlink("B2", "Data!D2"), options)
+                        .unwrap();
+                }
+                2 => {
+                    workbook.undo(options).unwrap();
+                }
+                3 => {
+                    workbook.redo(options).unwrap();
+                }
+                _ => {}
+            }
+            let doc = Doc::new();
+            hydrate_doc(&doc, &workbook.encode_state_as_update_v1()).unwrap();
+            let authority = WorkbookAuthority::hydrated(doc, base.clone(), 0);
+            assert_eq!(authority.strict_materialize().unwrap().0, *workbook.model());
+            snapshot_validation::validate_for_test(&authority, workbook.model().clone()).unwrap();
+        }
+    }
+
+    #[test]
+    fn anchored_hyperlink_baselines_validate_and_refuse_peer_edits_atomically() {
+        let mut model = WorkbookModel::default();
+        model.sheets.push(Sheet::new("Data"));
+        model.sheets[0].hyperlinks = vec![test_hyperlink("$A$1", "Data!D1")];
+        let authority = WorkbookAuthority::from_model_with_client_id(&model, 265).unwrap();
+        assert_eq!(authority.strict_materialize().unwrap().0, model);
+        snapshot_validation::validate_for_test(&authority, model.clone()).unwrap();
+        let original = authority.encode_state_as_update_v1();
+        let vector = authority.encode_state_vector_v1();
+        for address in ["A1", "B2"] {
+            for remove in [false, true] {
+                let doc = Doc::with_client_id(266);
+                hydrate_doc(&doc, &original).unwrap();
                 {
-                    let mut txn = authority.doc.transact_mut();
+                    let mut txn = doc.transact_mut();
                     let sheet = txn
                         .get_map(SHEETS)
                         .unwrap()
@@ -9162,22 +9256,35 @@ mod tests {
                         .unwrap()
                         .cast::<MapRef>()
                         .unwrap();
-                    if baseline {
-                        sheet.try_update(
-                            &mut txn,
-                            HYPERLINKS,
-                            serde_json::to_string(&[link]).unwrap(),
-                        );
+                    let key = format!("hyperlink:{address}");
+                    if remove {
+                        sheet.try_update(&mut txn, key, false);
                     } else {
                         sheet.try_update(
                             &mut txn,
-                            "hyperlink:A1",
-                            serde_json::to_string(&link).unwrap(),
+                            key,
+                            serde_json::to_string(&test_hyperlink(address, "Data!D2")).unwrap(),
                         );
                     }
                 }
-                assert!(authority.strict_materialize().is_err());
-                assert!(snapshot_validation::validate_for_test(&authority, model).is_err());
+                let hostile = WorkbookAuthority::hydrated(doc, authority.base.clone(), 0);
+                assert_eq!(
+                    hostile.strict_materialize().unwrap_err(),
+                    "cannot edit anchored imported hyperlinks"
+                );
+                assert_eq!(
+                    snapshot_validation::validate_for_test(&hostile, model.clone())
+                        .unwrap_err()
+                        .to_string(),
+                    "cannot edit anchored imported hyperlinks"
+                );
+                assert!(matches!(
+                    authority.stage_updates_v1(&[&hostile.encode_state_as_update_v1()], None),
+                    Err(AuthorityError::InvalidState(_))
+                ));
+                assert_eq!(authority.encode_state_as_update_v1(), original);
+                assert_eq!(authority.encode_state_vector_v1(), vector);
+                assert_eq!(authority.strict_materialize().unwrap().0, model);
             }
         }
     }

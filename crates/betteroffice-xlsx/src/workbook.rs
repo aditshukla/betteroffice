@@ -57,7 +57,7 @@ use xlsx_render::{
 use crate::authority::{
     AuthorityError, HistoryUpdate, MAX_STATE_VECTOR_ENTRIES, SnapshotAdoption, StagedLocalUpdate,
     StagedUpdate, SyncOrigin, WorkbookAuthority, WorkbookStructure,
-    is_collaborative_local_layout_op, is_structural_op,
+    is_collaborative_local_layout_op, is_structural_op, validate_hyperlink_edit_baseline,
 };
 use crate::move_range::{move_range_ops, preserved_move_unsupported_part};
 use crate::sheet_json::{
@@ -3910,11 +3910,27 @@ fn validate_op(model: &WorkbookModel, op: &Op) -> Result<()> {
             validate_hyperlinks(hyperlinks)?;
         }
         Op::SetHyperlink { sheet, hyperlink } => {
-            require_sheet(model, *sheet)?;
+            validate_hyperlink_edit_baseline(&require_sheet(model, *sheet)?.hyperlinks)
+                .map_err(Error::InvalidOperation)?;
             validate_hyperlinks(std::slice::from_ref(hyperlink))?;
+            if [
+                &hyperlink.external_target,
+                &hyperlink.location,
+                &hyperlink.tooltip,
+                &hyperlink.display,
+            ]
+            .into_iter()
+            .flatten()
+            .any(String::is_empty)
+            {
+                return Err(Error::InvalidOperation(
+                    "hyperlink field must not be empty".to_string(),
+                ));
+            }
         }
         Op::RemoveHyperlink { sheet, range } => {
-            require_sheet(model, *sheet)?;
+            validate_hyperlink_edit_baseline(&require_sheet(model, *sheet)?.hyperlinks)
+                .map_err(Error::InvalidOperation)?;
             validate_range(*range)?;
         }
         Op::SetChartAnchor {
@@ -4343,11 +4359,6 @@ fn validate_hyperlinks(hyperlinks: &[Hyperlink]) -> Result<()> {
         .into_iter()
         .flatten()
         {
-            if value.is_empty() {
-                return Err(Error::InvalidOperation(
-                    "hyperlink field must not be empty".to_string(),
-                ));
-            }
             if value.len() > MAX_HYPERLINK_FIELD_BYTES {
                 return Err(Error::InvalidOperation(
                     "hyperlink field exceeds its length limit".to_string(),

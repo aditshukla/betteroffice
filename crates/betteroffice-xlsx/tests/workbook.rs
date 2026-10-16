@@ -6122,6 +6122,98 @@ fn anchored_imported_hyperlink_ranges_are_normalized_before_collaboration() {
 }
 
 #[test]
+fn imported_empty_hyperlink_fields_allow_edits_undo_and_redo_in_both_modes() {
+    let mut model = WorkbookModel::default();
+    model.sheets.push(Sheet::new("Data"));
+    let mut parts = xlsx_parse::serialize_workbook(&model).unwrap();
+    set_test_part(
+        &mut parts,
+        "xl/worksheets/sheet1.xml",
+        br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/><hyperlinks><hyperlink ref="A1" location="Data!D1" tooltip="" display=""/></hyperlinks></worksheet>"#.to_vec(),
+    );
+    let bytes = ooxml_opc::rezip_parts(&parts).unwrap();
+    for collaborative in [false, true] {
+        let mut editor = if collaborative {
+            Workbook::open_collaborative(&bytes, 1256)
+        } else {
+            Workbook::open(&bytes)
+        }
+        .unwrap();
+        let original = editor.model().sheets[0].hyperlinks.clone();
+        assert_eq!(original[0].tooltip.as_deref(), Some(""));
+        assert_eq!(original[0].display.as_deref(), Some(""));
+        let options = CalculationOptions::default();
+        let added = internal_link("B2", "Data!D2");
+        editor
+            .set_hyperlink(SheetId(0), added.clone(), options)
+            .unwrap();
+        let expected = vec![original[0].clone(), added];
+        assert_eq!(editor.model().sheets[0].hyperlinks, expected);
+        editor.undo(options).unwrap();
+        assert_eq!(editor.model().sheets[0].hyperlinks, original);
+        editor.redo(options).unwrap();
+        assert_eq!(editor.model().sheets[0].hyperlinks, expected);
+    }
+}
+
+#[test]
+fn bulk_anchored_hyperlink_baselines_refuse_single_link_edits_atomically_in_both_modes() {
+    let mut model = WorkbookModel::default();
+    model.sheets.push(Sheet::new("Data"));
+    let mut source = Workbook::from_model(model).unwrap();
+    let options = CalculationOptions::default();
+    let original = internal_link("$A$1", "Data!D1");
+    source
+        .apply_ops(
+            vec![Op::SetHyperlinks {
+                sheet: SheetId(0),
+                hyperlinks: vec![original.clone()],
+            }],
+            options,
+        )
+        .unwrap();
+    assert_eq!(source.model().sheets[0].hyperlinks, vec![original]);
+    for collaborative in [false, true] {
+        let model = source.model().clone();
+        let mut editor = if collaborative {
+            Workbook::from_model_collaborative(model, 1257)
+        } else {
+            Workbook::from_model(model)
+        }
+        .unwrap();
+        for address in ["A1", "B2"] {
+            for remove in [false, true] {
+                let before = editor.model().clone();
+                let state = editor.encode_state_as_update_v1();
+                let vector = editor.encode_state_vector_v1();
+                let result = if remove {
+                    editor.remove_hyperlink(
+                        SheetId(0),
+                        CellRange::parse_a1(address).unwrap(),
+                        options,
+                    )
+                } else {
+                    editor.set_hyperlink(SheetId(0), internal_link(address, "Data!D2"), options)
+                };
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("anchored imported hyperlinks")
+                );
+                assert_eq!(editor.model(), &before);
+                assert_eq!(editor.encode_state_as_update_v1(), state);
+                assert_eq!(editor.encode_state_vector_v1(), vector);
+            }
+        }
+    }
+    source.undo(options).unwrap();
+    assert!(source.model().sheets[0].hyperlinks.is_empty());
+    source.redo(options).unwrap();
+    assert_eq!(source.model().sheets[0].hyperlinks[0].range.to_a1(), "$A$1");
+}
+
+#[test]
 fn empty_optional_hyperlink_fields_are_refused_locally() {
     for collaborative in [false, true] {
         for field in 0..4 {

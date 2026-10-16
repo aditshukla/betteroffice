@@ -657,10 +657,6 @@ impl<'de> Visitor<'de> for HyperlinkSeed {
             || range.start.col > range.end.col
             || range.end.row >= MAX_ROWS
             || range.end.col >= MAX_COLS
-            || range.start.abs_row
-            || range.start.abs_col
-            || range.end.abs_row
-            || range.end.abs_col
         {
             return Err(A::Error::custom(HYPERLINK_OUT_OF_BOUNDS));
         }
@@ -671,18 +667,6 @@ impl<'de> Visitor<'de> for HyperlinkSeed {
             && hyperlink.location.as_deref().is_none_or(str::is_empty)
         {
             return Err(A::Error::custom(HYPERLINK_NO_DESTINATION));
-        }
-        if [
-            &hyperlink.external_target,
-            &hyperlink.location,
-            &hyperlink.tooltip,
-            &hyperlink.display,
-        ]
-        .into_iter()
-        .flatten()
-        .any(String::is_empty)
-        {
-            return Err(A::Error::custom("sheet hyperlink field must not be empty"));
         }
         Ok(hyperlink)
     }
@@ -858,7 +842,7 @@ mod tests {
     }
 
     #[test]
-    fn hyperlink_reader_refuses_empty_fields_anchors_and_noncanonical_json() {
+    fn hyperlink_reader_accepts_legacy_fields_and_anchors_but_refuses_noncanonical_json() {
         for field in 0..4 {
             let mut link = hyperlink();
             link.location = Some("Sheet2!A1".into());
@@ -868,11 +852,19 @@ mod tests {
                 2 => link.tooltip = Some(String::new()),
                 _ => link.display = Some(String::new()),
             }
-            assert!(decode_hyperlinks(&serde_json::to_string(&[link]).unwrap()).is_err());
+            assert_eq!(
+                decode_hyperlinks(&serde_json::to_string(std::slice::from_ref(&link)).unwrap())
+                    .unwrap(),
+                vec![link]
+            );
         }
         let mut link = hyperlink();
         link.range = CellRange::parse_a1("$A$1").unwrap();
-        assert!(decode_hyperlinks(&serde_json::to_string(&[link]).unwrap()).is_err());
+        assert_eq!(
+            decode_hyperlinks(&serde_json::to_string(std::slice::from_ref(&link)).unwrap())
+                .unwrap(),
+            vec![link]
+        );
         let canonical = serde_json::to_string(&[hyperlink()]).unwrap();
         for json in [format!(" {canonical}"), canonical.replace("null", " null")] {
             assert!(decode_hyperlinks(&json).is_err());
