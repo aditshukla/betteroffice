@@ -59,6 +59,12 @@ pub enum ChartFill {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         background: Option<String>,
     },
+    /// `a:gradFill`, kept as its stop colours.
+    Gradient {
+        colors: Vec<String>,
+    },
+    /// Another fill, such as `a:blipFill`, painted in the host's default.
+    Unsupported,
 }
 
 /// The `a:ln` of a `c:spPr`.
@@ -126,7 +132,7 @@ impl ChartTextProperties {
 /// A cell the sheet left blank has no number. It travels as `null`, because
 /// JSON has no NaN and the plot has to keep the blank in place to line the
 /// values up with their categories.
-mod blank_numbers {
+pub mod blank_numbers {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S: Serializer>(values: &[f64], serializer: S) -> Result<S::Ok, S::Error> {

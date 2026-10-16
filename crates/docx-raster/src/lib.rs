@@ -424,7 +424,21 @@ impl<'k> Renderer<'k> {
         {
             paint_page_border(pixmap, border, &mut self.scratch.budget)?;
         }
-        for primitive in &page.primitives {
+        let (watermark, body) = page.primitives.split_at(
+            page.watermark_primitive_count
+                .unwrap_or(0)
+                .min(page.primitives.len()),
+        );
+        for primitive in watermark {
+            self.paint_primitive(pixmap, primitive, resources, ImageScope::Body)?;
+        }
+        for region in [&page.header, &page.footer].into_iter().flatten() {
+            let scope = ImageScope::HeaderFooter(&region.r_id);
+            for primitive in &region.primitives {
+                self.paint_primitive(pixmap, primitive, resources, scope)?;
+            }
+        }
+        for primitive in body {
             self.paint_primitive(pixmap, primitive, resources, ImageScope::Body)?;
         }
         for area in &page.note_areas {
@@ -433,12 +447,6 @@ impl<'k> Renderer<'k> {
                 self.paint_primitive(pixmap, primitive, resources, scope)?;
             }
             for primitive in &area.primitives {
-                self.paint_primitive(pixmap, primitive, resources, scope)?;
-            }
-        }
-        for region in [&page.header, &page.footer].into_iter().flatten() {
-            let scope = ImageScope::HeaderFooter(&region.r_id);
-            for primitive in &region.primitives {
                 self.paint_primitive(pixmap, primitive, resources, scope)?;
             }
         }
@@ -683,6 +691,16 @@ fn paint_shape(
     opacity: f32,
     budget: &mut PageBudget,
 ) -> Result<(), String> {
+    if shape
+        .attrs
+        .fill_paint
+        .as_ref()
+        .and_then(|paint| paint.get("kind"))
+        .and_then(Value::as_str)
+        == Some("picture")
+    {
+        return Ok(());
+    }
     if !shape.attrs.effects.is_empty() {
         return Err("unsupported shape field: effects".to_string());
     }
@@ -1298,6 +1316,17 @@ enum Decode {
     OverBudget,
 }
 
+/// Decoder limits holding one image to its declared size and its decoder to
+/// `max_alloc` bytes, so a frame larger than the declared size fails against
+/// the budget left instead of the default limit.
+fn decoder_limits(declared_width: u32, declared_height: u32, max_alloc: u64) -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(declared_width);
+    limits.max_image_height = Some(declared_height);
+    limits.max_alloc = Some(max_alloc);
+    limits
+}
+
 /// A decoded image and what resolving it cost the page that decoded it.
 struct CachedImage {
     outcome: Option<Arc<Pixmap>>,
@@ -1489,8 +1518,8 @@ impl<'c> PageImages<'c> {
 
     /// `Decoded` pixels, `Refused` for content this backend will not draw
     /// (bytes it cannot decode, or an image past [`MAX_IMAGE_PIXELS`] or
-    /// [`MAX_IMAGE_BYTES`]), or `OverBudget` when the page has no decode
-    /// budget left. Declared pixels are charged before the decoder allocates,
+    /// [`MAX_IMAGE_BYTES`]), or `OverBudget` when the page's decode budget
+    /// left is too small, which the next page retries. Declared pixels are charged before the decoder allocates,
     /// so a stream that fails late still costs what it claimed.
     fn decode(&mut self, bytes: &[u8], charge: &mut ImageCharge) -> Decode {
         use image::ImageDecoder as _;
@@ -1524,11 +1553,21 @@ impl<'c> PageImages<'c> {
         charge.pixels = declared;
         charge.bytes_post = cost;
         IMAGE_DECODE_COUNT.fetch_add(1, Ordering::Relaxed);
+        let image_left = MAX_IMAGE_BYTES.saturating_sub(cost);
+        let page_left = MAX_PAGE_IMAGE_BYTES.saturating_sub(self.bytes);
+        let limits = decoder_limits(declared_width, declared_height, image_left.min(page_left));
+        if decoder.set_limits(limits).is_err() {
+            return Decode::Refused;
+        }
         let Ok(orientation) = decoder.orientation() else {
             return Decode::Refused;
         };
-        let Ok(mut decoded) = image::DynamicImage::from_decoder(decoder) else {
-            return Decode::Refused;
+        let mut decoded = match image::DynamicImage::from_decoder(decoder) {
+            Ok(decoded) => decoded,
+            Err(image::ImageError::Limits(_)) if page_left < image_left => {
+                return Decode::OverBudget;
+            }
+            Err(_) => return Decode::Refused,
         };
         decoded.apply_orientation(orientation);
         let Some(size) = IntSize::from_wh(decoded.width(), decoded.height()) else {
@@ -2901,5 +2940,38 @@ mod tests {
         let mut broke = PageImages::new(&mut cache);
         broke.bytes = MAX_PAGE_IMAGE_BYTES;
         assert!(!broke.charge(charge));
+    }
+
+    fn gif_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut gif = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut gif);
+            let pixels = vec![0u8; (width * height * 3) as usize];
+            encoder
+                .encode(&pixels, width, height, image::ExtendedColorType::Rgb8)
+                .expect("encode gif");
+        }
+        gif
+    }
+
+    #[test]
+    fn a_gif_frame_past_its_screen_waits_for_a_page_with_budget_left() {
+        let mut gif = gif_bytes(64, 64);
+        gif[6..10].copy_from_slice(&[1, 0, 1, 0]);
+        let mut cache = ImageCache::new();
+        let mut crowded = PageImages::new(&mut cache);
+        crowded.pixels = MAX_PAGE_IMAGE_PIXELS - 16;
+        crowded.bytes = MAX_PAGE_IMAGE_BYTES - 1024;
+        assert!(crowded.resolve(ImageSource::Registered(&gif)).is_none());
+        let pixmap = PageImages::new(&mut cache)
+            .resolve(ImageSource::Registered(&gif))
+            .expect("a page with budget left decodes it");
+        assert_eq!((pixmap.width(), pixmap.height()), (1, 1));
+
+        let gif = gif_bytes(64, 64);
+        let mut cache = ImageCache::new();
+        let mut page = PageImages::new(&mut cache);
+        let mut charge = ImageCharge::default();
+        assert!(matches!(page.decode(&gif, &mut charge), Decode::Decoded(_)));
     }
 }

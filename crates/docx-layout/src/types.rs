@@ -375,6 +375,8 @@ pub struct ImageRun {
     pub hyperlink: Option<HyperlinkInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inline_shape: Option<Box<ShapeBlock>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_chart: Option<Box<ChartBlock>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_insertion: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -407,14 +409,25 @@ pub struct FieldRun {
     pub fmt: RunFormatting,
     pub field_type: String,
     /// Raw Word field type token, kept when `field_type` collapsed it to a
-    /// coarse category. Inert identity for announcement; never evaluated.
+    /// coarse category. Carried for announcement, and read to number SEQ
+    /// fields (see [`crate::sequence_fields`]); never evaluated otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_type: Option<String>,
-    /// raw field instruction text carried INERT for a11y announcement only
+    /// Raw field instruction text, carried for a11y announcement. Only a SEQ
+    /// field's is read, to number it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruction: Option<String>,
+    /// The result the field shows: Word's cached result, or a SEQ field's
+    /// recomputed number.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
+    /// `w:fldLock`: Word keeps the cached result when it updates fields.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
+    /// Sequences (lower-case names) of SEQ fields nested in this field's code
+    /// or result, which the field's single run doesn't show.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested_sequences: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pm_start: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -885,6 +898,8 @@ pub struct TableBlock {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_layout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub width_algorithm: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub style_cascade: Option<Value>,
@@ -902,6 +917,8 @@ pub struct TableBlock {
     pub compatibility_mode: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cell_margin_left: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_margin_right: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pm_start: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1003,6 +1020,8 @@ pub struct ShapeBlock {
     pub y: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inner_text: Option<Vec<ParagraphBlock>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested_sequences: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inner_measures: Option<Vec<ParagraphExtent>>,
     pub children: Vec<ShapeBlock>,
@@ -1347,6 +1366,7 @@ impl PartialEq for ImageRun {
             decorative: _,
             hyperlink: _,
             inline_shape: _,
+            inline_chart: _,
             is_insertion: _,
             is_deletion: _,
             change_author: _,
@@ -1388,6 +1408,7 @@ impl PartialEq for ImageRun {
             && self.decorative == other.decorative
             && self.hyperlink == other.hyperlink
             && self.inline_shape == other.inline_shape
+            && self.inline_chart == other.inline_chart
             && self.is_insertion == other.is_insertion
             && self.is_deletion == other.is_deletion
             && self.change_author == other.change_author
@@ -1414,6 +1435,8 @@ impl PartialEq for FieldRun {
             raw_type: _,
             instruction: _,
             fallback: _,
+            locked: _,
+            nested_sequences: _,
             pm_start: _,
             pm_end: _,
         } = other;
@@ -1422,6 +1445,8 @@ impl PartialEq for FieldRun {
             && self.raw_type == other.raw_type
             && self.instruction == other.instruction
             && self.fallback == other.fallback
+            && self.locked == other.locked
+            && self.nested_sequences == other.nested_sequences
     }
 }
 
@@ -1456,6 +1481,7 @@ impl PartialEq for TableBlock {
             width_type: _,
             preferred_width: _,
             layout_mode: _,
+            table_layout: _,
             width_algorithm: _,
             style_cascade: _,
             background: _,
@@ -1465,6 +1491,7 @@ impl PartialEq for TableBlock {
             floating: _,
             compatibility_mode: _,
             cell_margin_left: _,
+            cell_margin_right: _,
             pm_start: _,
             pm_end: _,
         } = other;
@@ -1477,6 +1504,7 @@ impl PartialEq for TableBlock {
             && self.width_type == other.width_type
             && self.preferred_width == other.preferred_width
             && self.layout_mode == other.layout_mode
+            && self.table_layout == other.table_layout
             && self.width_algorithm == other.width_algorithm
             && self.style_cascade == other.style_cascade
             && self.background == other.background
@@ -1486,6 +1514,7 @@ impl PartialEq for TableBlock {
             && self.floating == other.floating
             && self.compatibility_mode == other.compatibility_mode
             && self.cell_margin_left == other.cell_margin_left
+            && self.cell_margin_right == other.cell_margin_right
     }
 }
 
@@ -1553,6 +1582,7 @@ impl PartialEq for ShapeBlock {
             x: _,
             y: _,
             inner_text: _,
+            nested_sequences: _,
             inner_measures: _,
             children: _,
             scene: _,
@@ -1584,6 +1614,7 @@ impl PartialEq for ShapeBlock {
             && self.x == other.x
             && self.y == other.y
             && self.inner_text == other.inner_text
+            && self.nested_sequences == other.nested_sequences
             && self.inner_measures == other.inner_measures
             && self.children == other.children
             && self.scene == other.scene
@@ -1799,6 +1830,9 @@ pub struct TypesetRow {
     pub segments: Option<Vec<TypesetRowSegment>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub float_skip_before: Option<f64>,
+    /// Extra first-line px after a marker overruns its hanging indent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub marker_tab_offset: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_advances: Option<Vec<TypesetRunAdvance>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1929,11 +1963,57 @@ pub struct LayoutOptions {
     pub title_page: Option<bool>,
     pub even_and_odd_headers: Option<bool>,
     pub footnote_reserved_heights: Option<BTreeMap<String, f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_separator_heights: Option<crate::footnotes::NoteSeparatorHeights>,
     pub body_break_type: Option<SectionBreakType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub section_page_restarts: Option<Vec<Option<SectionPageRestart>>>,
+    /// Per section, the body margins of the pages that show a header or
+    /// footer other than the default one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_page_margins: Option<Vec<SectionPageMargins>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_page_float_bands: Option<Vec<SectionPageFloatBands>>,
     #[serde(default)]
     pub sections: Option<Vec<SectionLayoutContract>>,
+}
+
+/// Body margins for a section's first page under `w:titlePg` and its even
+/// pages under `w:evenAndOddHeaders`, each widened by the band that page
+/// shows. `None` where the flag is off: those pages use the section margins.
+/// `restart` is the section's `w:pgNumType w:start`, whose parity decides
+/// which pages are even.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SectionPageMargins {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first: Option<PageMargins>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub even: Option<PageMargins>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<u64>,
+}
+
+/// A full-width float exclusion in page coordinates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageFloatBand {
+    pub top: f64,
+    pub bottom: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub odd_page: Option<bool>,
+}
+
+/// Float bands for each header/footer variant a section shows.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SectionPageFloatBands {
+    pub default: Vec<PageFloatBand>,
+    pub first: Option<Vec<PageFloatBand>>,
+    pub even: Option<Vec<PageFloatBand>>,
+    /// Authored margins for float anchors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_margins: Option<PageMargins>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -2005,6 +2085,15 @@ pub struct ParagraphFragment {
     pub resolved_lines: Option<Vec<ResolvedLine>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CellClip {
+    pub row: usize,
+    pub cell: usize,
+    pub top: f64,
+    pub bottom: f64,
+}
+
 /// One page's slice of a table: rows `[row_start, row_end)`, plus
 /// `clip_top` / `clip_bottom` when the boundary cuts through a row that broke
 /// mid-content, and `header_row_count` when this fragment repeats the header
@@ -2035,6 +2124,8 @@ pub struct TableFragment {
     pub clip_top: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clip_bottom: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_clips: Option<Vec<CellClip>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2208,7 +2299,7 @@ impl Fragment {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HeaderFooterRefs {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2225,6 +2316,24 @@ pub struct HeaderFooterRefs {
     pub footer_even: Option<String>,
 }
 
+impl HeaderFooterRefs {
+    /// Takes each reference a later section authors, keeping the ones it leaves unset.
+    pub fn inherit(&mut self, authored: &HeaderFooterRefs) {
+        for (inherited, authored) in [
+            (&mut self.header_default, &authored.header_default),
+            (&mut self.header_first, &authored.header_first),
+            (&mut self.header_even, &authored.header_even),
+            (&mut self.footer_default, &authored.footer_default),
+            (&mut self.footer_first, &authored.footer_first),
+            (&mut self.footer_even, &authored.footer_even),
+        ] {
+            if authored.is_some() {
+                inherited.clone_from(authored);
+            }
+        }
+    }
+}
+
 /// One paginated page: its geometry, the fragments placed on it in paint order,
 /// and the section-derived metadata a renderer needs for page numbering, header
 /// and footer selection, borders and note areas.
@@ -2233,7 +2342,17 @@ pub struct HeaderFooterRefs {
 pub struct Page {
     pub number: u32,
     pub fragments: Vec<Fragment>,
+    #[serde(skip)]
+    pub(crate) float_bands: Vec<PageFloatBand>,
+    #[serde(skip)]
+    pub(crate) opening_fragment_geometry: Option<Box<crate::page_flow::OpeningFragmentGeometry>>,
     pub margins: PageMargins,
+    /// Body flow margins when they differ from the anchor frame.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_margins: Option<PageMargins>,
+    /// Effective body anchor margins before float exclusions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_anchor_margins: Option<PageMargins>,
     pub size: Size,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub orientation: Option<String>,
@@ -2278,6 +2397,12 @@ pub struct Page {
     pub parity_filler: Option<bool>,
 }
 
+impl Page {
+    pub fn has_float_bands(&self) -> bool {
+        !self.float_bands.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct HeaderFooterLayout {
     pub height: f64,
@@ -2298,6 +2423,12 @@ pub struct Layout {
     pub footers: Option<BTreeMap<String, HeaderFooterLayout>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page_gap: Option<f64>,
+    /// Covers only part of the document.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
+    /// While `partial`, NUMPAGES renders the field's cached result.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cached_page_totals: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2520,6 +2651,8 @@ pub struct DisplayListContractMetadata {
 #[serde(rename_all = "camelCase")]
 pub struct DisplayPageContractMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watermark_primitive_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note_areas: Option<Vec<NoteAreaContract>>,
@@ -2702,6 +2835,58 @@ pub struct DisplayCommentAuthorContract {
 mod contract_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn optional_inline_chart_round_trips_and_changes_measurement_identity() {
+        let legacy: ImageRun = serde_json::from_value(json!({
+            "src": "", "width": 192.0, "height": 96.0
+        }))
+        .unwrap();
+        assert!(legacy.inline_chart.is_none());
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("inlineChart")
+                .is_none()
+        );
+        let chart = json!({
+            "id": "chart:inline", "width": 192.0, "height": 96.0,
+            "chart": {
+                "chartType": "column",
+                "series": [{"name": "Sales", "categories": ["Q1"], "values": [2.0]}]
+            }
+        });
+        let mut inline = legacy.clone();
+        inline.inline_chart = Some(Box::new(serde_json::from_value(chart.clone()).unwrap()));
+        assert_ne!(legacy, inline);
+        let value = serde_json::to_value(&inline).unwrap();
+        assert_eq!(value["inlineChart"], chart);
+        assert_eq!(serde_json::from_value::<ImageRun>(value).unwrap(), inline);
+        let mut edited = inline.clone();
+        edited.inline_chart.as_mut().unwrap().chart["series"][0]["values"][0] = json!(4.0);
+        assert_ne!(inline, edited);
+    }
+
+    #[test]
+    fn optional_table_layout_round_trips_and_changes_measurement_identity() {
+        let legacy: TableBlock = serde_json::from_value(json!({"id": 0, "rows": []})).unwrap();
+        assert_eq!(legacy.table_layout, None);
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("tableLayout")
+                .is_none()
+        );
+        let mut fixed = legacy.clone();
+        fixed.table_layout = Some("fixed".to_owned());
+        assert_ne!(legacy, fixed);
+        let value = serde_json::to_value(&fixed).unwrap();
+        assert_eq!(value["tableLayout"], "fixed");
+        assert_eq!(serde_json::from_value::<TableBlock>(value).unwrap(), fixed);
+        let mut autofit = fixed.clone();
+        autofit.table_layout = Some("autofit".to_owned());
+        assert_ne!(fixed, autofit);
+    }
 
     #[test]
     fn old_optional_contracts_deserialize_to_noop_defaults() {
