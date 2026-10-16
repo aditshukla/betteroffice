@@ -34,12 +34,18 @@ use yrs::{
 mod cascade_composition_tests;
 #[cfg(test)]
 mod fingerprint_composition_tests;
+mod hyperlinks;
 mod merges;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod snapshot;
 pub(crate) mod snapshot_validation;
+use hyperlinks::{
+    HYPERLINK_PREFIX, HyperlinkBaseline, HyperlinkEdits, HyperlinkProjection, clear_hyperlink_edits,
+    insert_hyperlink_edit, project_hyperlinks, sync_hyperlinks,
+};
 use merges::{
-    MERGE_PREFIX, MergeEdits, MergeProjection, clear_merge_edits, insert_merge_edit, project_merges,
+    MERGE_PREFIX, MergeEdits, MergeProjection, clear_merge_edits, clear_sheet_edits,
+    insert_merge_edit, project_merges,
 };
 
 const META: &str = "xlsx";
@@ -53,8 +59,7 @@ const MIN_SUPPORTED_SCHEMA_VERSION: i64 = 3;
 const FREEZE_PANE_SCHEMA_VERSION: i64 = 4;
 const HYPERLINK_SCHEMA_VERSION: i64 = 5;
 const CHARTS_SCHEMA_VERSION: i64 = 6;
-const HYPERLINK_EDITS_SCHEMA_VERSION: i64 = 8;
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 6;
 const BASE_FINGERPRINT: &str = "baseFingerprint";
 const STRUCTURE_GENERATION: &str = "structureGeneration";
 const CHARTS: &str = "charts";
@@ -64,7 +69,6 @@ const COL_STYLES: &str = "colStyles";
 const ROW_STYLES: &str = "rowStyles";
 const FREEZE_PANE: &str = "freezePane";
 const HYPERLINKS: &str = "hyperlinks";
-const HYPERLINK_EDITS: &str = "hyperlinkEdits";
 const MERGES: &str = "merges";
 const NAME: &str = "name";
 const ROW_HEIGHTS: &str = "rowHeights";
@@ -598,7 +602,6 @@ struct SheetSharedTypes {
     contents: BranchID,
     row_heights: BranchID,
     styles: BranchID,
-    hyperlink_edits: Option<BranchID>,
 }
 
 /// What a replica can do with an update offered as its whole state.
@@ -1073,11 +1076,6 @@ impl WorkbookAuthority {
         let ops =
             remap_styles(ops, styles, &mut model.styles).map_err(AuthorityError::InvalidState)?;
         let ops = ops.as_ref();
-        let before_hyperlinks = model
-            .sheets
-            .iter()
-            .map(|sheet| sheet.hyperlinks.clone())
-            .collect::<Vec<_>>();
         let authored_styles = ops
             .iter()
             .filter_map(|op| match op {
@@ -1104,14 +1102,7 @@ impl WorkbookAuthority {
         if self.base.tables != model.tables {
             Arc::make_mut(&mut self.base).tables = model.tables.clone();
         }
-        self.sync_model(
-            &model,
-            ops,
-            origin,
-            &authored_styles,
-            collaborative,
-            &before_hyperlinks,
-        )
+        self.sync_model(&model, ops, origin, &authored_styles, collaborative)
             .map_err(AuthorityError::InvalidState)?;
         if let [Op::SetCell { at, cell, .. }] = ops
             && at.row < MAX_ROWS
@@ -1253,15 +1244,7 @@ impl WorkbookAuthority {
         update: &[u8],
         legacy_styles: impl FnOnce() -> Option<xlsx_parse::LegacyStyleReadings>,
     ) -> SnapshotAdoption {
-        let pristine = self.is_pristine();
-        if !pristine
-            && (!update
-                .windows(BASE_FINGERPRINT.len())
-                .any(|part| part == BASE_FINGERPRINT.as_bytes())
-                || !update
-                    .windows(b"schemaVersion".len())
-                    .any(|part| part == b"schemaVersion"))
-        {
+        if !self.is_pristine() {
             return SnapshotAdoption::NotApplicable;
         }
         let doc = Doc::with_client_id(self.client_id());
@@ -1270,27 +1253,6 @@ impl WorkbookAuthority {
         }
         let mut candidate = Self::hydrated(doc, self.base.clone(), self.next_sheet_id);
         if !candidate.is_whole_document() {
-            return SnapshotAdoption::NotApplicable;
-        }
-        if !pristine {
-            let version = candidate.schema_version().unwrap_or_default();
-            let txn = candidate.doc.transact();
-            let fingerprint = txn
-                .get_map(META)
-                .and_then(|meta| meta.get(&txn, BASE_FINGERPRINT))
-                .and_then(|value| value.cast::<String>().ok());
-            let same_bootstrap = txn
-                .state_vector()
-                .iter()
-                .any(|(client, _)| client.get() == self.base.bootstrap_client_id);
-            if version != SCHEMA_VERSION
-                || fingerprint.as_deref() != Some(self.base.fingerprint.as_str())
-                || !same_bootstrap
-            {
-                return SnapshotAdoption::Incompatible(
-                    "cannot merge a foreign workbook snapshot after local edits".to_string(),
-                );
-            }
             return SnapshotAdoption::NotApplicable;
         }
         let accepted = candidate
@@ -2006,9 +1968,6 @@ impl WorkbookAuthority {
             if version < CHARTS_SCHEMA_VERSION {
                 sheet.try_update(&mut txn, CHARTS, charts);
             }
-            if version < HYPERLINK_EDITS_SCHEMA_VERSION {
-                let _: MapRef = sheet.get_or_init(&mut txn, HYPERLINK_EDITS);
-            }
         }
         let meta = txn
             .get_map(META)
@@ -2254,7 +2213,6 @@ impl WorkbookAuthority {
         origin: SyncOrigin,
         authored_styles: &HashMap<(u32, CellRef), Option<u32>>,
         collaborative: bool,
-        before_hyperlinks: &[Vec<Hyperlink>],
     ) -> Result<(), String> {
         let current_keys = self.current_sheet_keys()?;
         let (keys, history) =
@@ -2285,7 +2243,13 @@ impl WorkbookAuthority {
                     is_structural_op(op)
                         && (!is_collaborative_local_layout_op(op)
                             || (!collaborative
-                                && matches!(op, Op::MergeCells { .. } | Op::UnmergeCells { .. })))
+                                && matches!(
+                                    op,
+                                    Op::MergeCells { .. }
+                                        | Op::UnmergeCells { .. }
+                                        | Op::SetHyperlink { .. }
+                                        | Op::RemoveHyperlink { .. }
+                                )))
                 })
                 .count(),
         )
@@ -2514,29 +2478,7 @@ impl WorkbookAuthority {
             for key in hyperlinks {
                 let (sheet_map, sheet_model) =
                     sheet_parts_by_key(&sheets, &txn, &keys, model, &key)?;
-                let index = keys
-                    .iter()
-                    .position(|candidate| candidate == &key)
-                    .ok_or_else(|| format!("sheet {key} is not active"))?;
-                let previous = before_hyperlinks
-                    .get(index)
-                    .ok_or_else(|| format!("sheet {key} has no prior hyperlink state"))?;
-                let edits: MapRef = sheet_map.get_or_init(&mut txn, HYPERLINK_EDITS);
-                for link in previous
-                    .iter()
-                    .filter(|link| !sheet_model.hyperlinks.contains(link))
-                {
-                    edits.try_update(&mut txn, link.range.to_a1(), Any::Null);
-                }
-                for link in sheet_model
-                    .hyperlinks
-                    .iter()
-                    .filter(|link| !previous.contains(link))
-                {
-                    let json = serde_json::to_string(link)
-                        .map_err(|error| format!("cannot encode hyperlink: {error}"))?;
-                    edits.try_update(&mut txn, link.range.to_a1(), json);
-                }
+                sync_hyperlinks(&sheet_map, &mut txn, sheet_model, collaborative)?;
             }
         }
         drop(txn);
@@ -3933,14 +3875,7 @@ fn sync_sheet_with_style_key(
     let hyperlinks = serde_json::to_string(&sheet.hyperlinks)
         .map_err(|error| format!("cannot encode sheet hyperlinks: {error}"))?;
     sheet_map.try_update(txn, HYPERLINKS, hyperlinks);
-    let hyperlink_edits: MapRef = sheet_map.get_or_init(txn, HYPERLINK_EDITS);
-    for key in hyperlink_edits
-        .keys(txn)
-        .map(str::to_string)
-        .collect::<Vec<_>>()
-    {
-        hyperlink_edits.remove(txn, &key);
-    }
+    clear_hyperlink_edits(sheet_map, txn);
     let charts = serde_json::to_string(&sheet.charts)
         .map_err(|error| format!("cannot encode sheet charts: {error}"))?;
     sheet_map.try_update(txn, CHARTS, charts);
@@ -4532,15 +4467,7 @@ fn materialize_sheet<T: ReadTxn>(
         }
         _ => fallbacks.hyperlinks.to_vec(),
     };
-    sheet.hyperlinks = if version >= HYPERLINK_EDITS_SCHEMA_VERSION {
-        project_hyperlinks(
-            baseline_hyperlinks,
-            &nested_map(sheet_map, txn, HYPERLINK_EDITS)?,
-            txn,
-        )?
-    } else {
-        baseline_hyperlinks
-    };
+    sheet.hyperlinks = project_hyperlinks(baseline_hyperlinks, sheet_map, txn)?;
     sheet.charts = match (version, sheet_map.get(txn, CHARTS)) {
         (CHARTS_SCHEMA_VERSION.., Some(Out::Any(Any::String(json)))) => decode_charts(&json)?,
         (CHARTS_SCHEMA_VERSION.., Some(_)) => {
@@ -4598,10 +4525,6 @@ fn sheet_shared_types<T: ReadTxn>(sheet_map: &MapRef, txn: &T) -> Result<SheetSh
         contents: nested_map(sheet_map, txn, CONTENTS)?.as_ref().id(),
         row_heights: nested_map(sheet_map, txn, ROW_HEIGHTS)?.as_ref().id(),
         styles: nested_map(sheet_map, txn, STYLES)?.as_ref().id(),
-        hyperlink_edits: sheet_map
-            .get(txn, HYPERLINK_EDITS)
-            .and_then(|value| value.cast::<MapRef>().ok())
-            .map(|map| map.as_ref().id()),
     })
 }
 
@@ -4696,23 +4619,11 @@ fn sheet_schema_keys(version: i64) -> &'static [&'static str] {
         ROW_HEIGHTS,
         STYLES,
     ];
-    const V8: &[&str] = &[
-        COL_WIDTHS,
-        CONTENTS,
-        FREEZE_PANE,
-        HYPERLINKS,
-        HYPERLINK_EDITS,
-        MERGES,
-        NAME,
-        ROW_HEIGHTS,
-        STYLES,
-    ];
     match version {
         MIN_SUPPORTED_SCHEMA_VERSION => V3,
         FREEZE_PANE_SCHEMA_VERSION => V4,
         HYPERLINK_SCHEMA_VERSION => V5,
-        CHARTS_SCHEMA_VERSION => V6,
-        _ => V8,
+        _ => V6,
     }
 }
 
@@ -4800,9 +4711,12 @@ fn require_sheet_keys<T: ReadTxn>(
         return Err(format!("{label} keys do not match the schema"));
     }
     let mut edits = MergeEdits::new();
+    let mut hyperlinks = HyperlinkEdits::new();
     for (key, value) in map.iter(txn) {
         if key.starts_with(MERGE_PREFIX) {
             insert_merge_edit(&mut edits, key, &value)?;
+        } else if key.starts_with(HYPERLINK_PREFIX) {
+            insert_hyperlink_edit(&mut hyperlinks, key, &value)?;
         } else if !expected.contains(&key) && !optional.contains(&key) {
             return Err(format!("{label} keys do not match the schema"));
         }
@@ -5051,72 +4965,6 @@ fn merges_from_any(value: &Any) -> Result<Vec<CellRange>, String> {
             Ok(range)
         })
         .collect()
-}
-
-fn project_hyperlinks<T: ReadTxn>(
-    baseline: Vec<Hyperlink>,
-    edits: &MapRef,
-    txn: &T,
-) -> Result<Vec<Hyperlink>, String> {
-    if edits.len(txn) == 0 {
-        return Ok(baseline);
-    }
-    for (index, link) in baseline.iter().enumerate() {
-        if baseline[index + 1..]
-            .iter()
-            .any(|other| link.range.overlaps(&other.range))
-        {
-            return Err("cannot edit overlapping imported hyperlinks".to_string());
-        }
-    }
-    let baseline_keys = baseline
-        .iter()
-        .map(|link| link.range.to_a1())
-        .collect::<Vec<_>>();
-    let mut links = baseline
-        .into_iter()
-        .map(|link| (link.range.to_a1(), link))
-        .collect::<BTreeMap<_, _>>();
-    for (key, value) in edits.iter(txn) {
-        let range =
-            CellRange::parse_a1(key).map_err(|_| format!("invalid hyperlink edit key {key}"))?;
-        if range.to_a1() != key {
-            return Err(format!("noncanonical hyperlink edit key {key}"));
-        }
-        match value {
-            Out::Any(Any::Null) => {
-                links.remove(key);
-            }
-            Out::Any(Any::String(json)) => {
-                let mut parsed = decode_hyperlinks(&format!("[{json}]"))?;
-                let link = parsed
-                    .pop()
-                    .ok_or_else(|| format!("empty hyperlink edit {key}"))?;
-                if link.range != range {
-                    return Err(format!("hyperlink edit {key} has a different range"));
-                }
-                links.insert(key.to_string(), link);
-            }
-            _ => return Err(format!("hyperlink edit {key} is not a link or removal")),
-        }
-    }
-    let mut ordered = Vec::with_capacity(links.len());
-    for key in baseline_keys {
-        if let Some(link) = links.remove(&key) {
-            ordered.push(link);
-        }
-    }
-    ordered.extend(links.into_values());
-    let mut projected = Vec::with_capacity(ordered.len());
-    for link in ordered {
-        if projected
-            .iter()
-            .all(|chosen: &Hyperlink| !chosen.range.overlaps(&link.range))
-        {
-            projected.push(link);
-        }
-    }
-    Ok(projected)
 }
 
 fn any_u32(value: &Any, label: &str) -> Result<u32, String> {
@@ -6483,6 +6331,7 @@ impl WorkbookAuthority {
             .map(str::to_string)
             .collect::<BTreeSet<_>>();
         let mut shared_types = BTreeMap::new();
+        let mut baseline_hyperlinks = BTreeMap::new();
         let mut baseline_merges = BTreeMap::new();
         for key in all_keys {
             let sheet_map = sheets
@@ -6509,6 +6358,15 @@ impl WorkbookAuthority {
             let Some(Out::Any(baseline)) = sheet_map.get(&txn, MERGES) else {
                 return Err(format!("sheet {key} is missing merges"));
             };
+            let link_baseline = match sheet_map.get(&txn, HYPERLINKS) {
+                Some(Out::Any(Any::String(json))) => decode_hyperlinks(&json)?,
+                None if version < HYPERLINK_SCHEMA_VERSION => base_sheet_index(&key)
+                    .and_then(|index| self.base.hyperlinks.get(index))
+                    .cloned()
+                    .unwrap_or_default(),
+                _ => return Err(format!("sheet {key} is missing hyperlinks")),
+            };
+            baseline_hyperlinks.insert(key.clone(), link_baseline);
             baseline_merges.insert(key.clone(), merges_from_any(&baseline)?);
             shared_types.insert(key, sheet_shared_types(&sheet_map, &txn)?);
         }
@@ -6526,6 +6384,7 @@ impl WorkbookAuthority {
                 .iter()
                 .map(|sheet| sheet.hyperlinks.clone())
                 .collect(),
+            baseline_hyperlinks,
             charts: model
                 .sheets
                 .iter()
@@ -6678,8 +6537,7 @@ fn fingerprint_model_with_row_styles_oracle(
         3 => b"betteroffice-xlsx-yrs-v3".as_slice(),
         4 => b"betteroffice-xlsx-yrs-v4".as_slice(),
         5 => b"betteroffice-xlsx-yrs-v5".as_slice(),
-        6 => b"betteroffice-xlsx-yrs-v6".as_slice(),
-        _ => b"betteroffice-xlsx-yrs-v8".as_slice(),
+        _ => b"betteroffice-xlsx-yrs-v6".as_slice(),
     };
     fingerprint_model_with_row_domain_oracle(
         model,
@@ -7779,9 +7637,6 @@ mod tests {
                 if version < FREEZE_PANE_SCHEMA_VERSION {
                     sheet.remove(&mut txn, FREEZE_PANE);
                 }
-                if version < HYPERLINK_EDITS_SCHEMA_VERSION {
-                    sheet.remove(&mut txn, HYPERLINK_EDITS);
-                }
             }
         }
         doc.transact()
@@ -8226,15 +8081,10 @@ mod tests {
     #[test]
     fn known_schema_versions_materialize_and_upgrade_to_current() {
         let model = rich_model();
-        for (index, (version, include_defined_names)) in [
-            (3, false),
-            (3, true),
-            (4, true),
-            (5, true),
-            (6, true),
-        ]
-        .into_iter()
-        .enumerate()
+        for (index, (version, include_defined_names)) in
+            [(3, false), (3, true), (4, true), (5, true)]
+                .into_iter()
+                .enumerate()
         {
             let update = legacy_update(&model, version, include_defined_names);
             let authority = authority_from_update(&model, &update, 101 + index as u64);
@@ -8422,7 +8272,7 @@ mod tests {
         };
         assert_eq!(
             error,
-            "unsupported schema version 9; supported versions are 3 through 8"
+            "unsupported schema version 7; supported versions are 3 through 6"
         );
     }
 
@@ -9101,6 +8951,473 @@ mod tests {
     }
 
     #[test]
+    fn unused_hyperlink_edits_preserve_schema_six_state_and_identity() {
+        for imported in [false, true] {
+            let mut model = rich_model();
+            if !imported {
+                for sheet in &mut model.sheets {
+                    sheet.hyperlinks.clear();
+                }
+            }
+            let mut authority = WorkbookAuthority::from_model_with_client_id(&model, 229).unwrap();
+            let mut oracle =
+                WorkbookAuthority::from_source_oracle(&model, Some(229), &[], None, &[]).unwrap();
+            assert_eq!(authority.schema_version().unwrap(), 6);
+            assert_eq!(authority.base.fingerprint, oracle.base.fingerprint);
+            assert_eq!(
+                authority.base.bootstrap_client_id,
+                oracle.base.bootstrap_client_id
+            );
+            assert_eq!(
+                authority.encode_state_as_update_v1(),
+                oracle.encode_state_as_update_v1()
+            );
+            let state = authority.encode_state_as_update_v1();
+            let SnapshotAdoption::Replacement(resumed) = authority.snapshot_replacement(&state)
+            else {
+                panic!("schema six snapshot refused")
+            };
+            assert_eq!(resumed.encode_state_as_update_v1(), state);
+            assert_eq!(resumed.schema_version().unwrap(), 6);
+            let ops = [Op::SetCell {
+                sheet: SheetId(0),
+                at: CellRef::new(20, 0),
+                cell: CellState {
+                    value: CellValue::Text {
+                        value: "edited".into(),
+                    },
+                    ..Default::default()
+                },
+            }];
+            for current in [&mut authority, &mut oracle] {
+                let staged = current
+                    .stage_local_ops_v1(&ops, SyncOrigin::User, &model.styles)
+                    .unwrap();
+                current
+                    .apply_local_update_v1(&staged.update, SyncOrigin::User)
+                    .unwrap();
+            }
+            assert_eq!(
+                authority.encode_state_as_update_v1(),
+                oracle.encode_state_as_update_v1()
+            );
+            for current in [&mut authority, &mut oracle] {
+                current.undo().unwrap().unwrap();
+                let txn = current.doc.transact();
+                let sheets = txn.get_map(SHEETS).unwrap();
+                for (_, sheet) in sheets.iter(&txn) {
+                    let sheet = sheet.cast::<MapRef>().unwrap();
+                    assert!(
+                        sheet
+                            .keys(&txn)
+                            .all(|key| !key.starts_with("hyperlink:") && key != "hyperlinkEdits")
+                    );
+                }
+                assert_eq!(current.schema_version().unwrap(), 6);
+            }
+            assert_eq!(
+                authority.encode_state_as_update_v1(),
+                oracle.encode_state_as_update_v1()
+            );
+        }
+    }
+
+    fn test_hyperlink(address: &str, location: &str) -> Hyperlink {
+        Hyperlink {
+            range: CellRange::parse_a1(address).unwrap(),
+            external_target: None,
+            location: Some(location.to_string()),
+            tooltip: None,
+            display: None,
+        }
+    }
+
+    #[test]
+    fn flat_hyperlink_keys_validate_in_snapshots_and_refuse_schema_six_peers() {
+        let mut model = rich_model();
+        model.sheets[0].hyperlinks = vec![
+            test_hyperlink("D4:E5", "Data!D1"),
+            test_hyperlink("A1:B2", "Data!A1"),
+        ];
+        let authority = WorkbookAuthority::from_model_with_client_id(&model, 230).unwrap();
+        {
+            let mut txn = authority.doc.transact_mut();
+            let sheet = txn
+                .get_map(SHEETS)
+                .unwrap()
+                .get(&txn, "sheet:0")
+                .unwrap()
+                .cast::<MapRef>()
+                .unwrap();
+            for address in ["C1:C2", "G1:H2"] {
+                sheet.try_update(
+                    &mut txn,
+                    format!("{HYPERLINK_PREFIX}{address}"),
+                    serde_json::to_string(&test_hyperlink(address, "Data!A1")).unwrap(),
+                );
+            }
+            sheet.try_update(&mut txn, "hyperlink:J1:K2", false);
+        }
+        let (projected, _) = authority.strict_materialize().unwrap();
+        assert_eq!(
+            &projected.sheets[0].hyperlinks[..2],
+            model.sheets[0].hyperlinks
+        );
+        assert!(authority.materialize_internal_oracle(true).is_err());
+        snapshot_validation::validate_for_test(&authority, projected).unwrap();
+        assert!(snapshot_validation::validate_for_test(&authority, model.clone()).is_err());
+
+        let mut old = crate::Workbook::from_model_collaborative(model.clone(), 231).unwrap();
+        let mut current = crate::Workbook::from_model_collaborative(model, 232).unwrap();
+        let before_vector = old.encode_state_vector_v1();
+        let before_bytes = old.encode_state_as_update_v1();
+        let before_model = old.model().clone();
+        let options = crate::CalculationOptions::default();
+        current
+            .apply_ops(
+                vec![
+                    Op::SetHyperlink {
+                        sheet: SheetId(0),
+                        hyperlink: test_hyperlink("J1:K2", "Data!A1"),
+                    },
+                    Op::SetCell {
+                        sheet: SheetId(0),
+                        at: CellRef::new(20, 0),
+                        cell: CellState {
+                            value: CellValue::Text {
+                                value: "new value".into(),
+                            },
+                            ..Default::default()
+                        },
+                    },
+                ],
+                options,
+            )
+            .unwrap();
+        let update = current.encode_diff_v1(&before_vector).unwrap();
+        SCHEMA_SIX_KEY_VALIDATION.set(true);
+        let result = old.apply_update_v1(&update, options);
+        SCHEMA_SIX_KEY_VALIDATION.set(false);
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("sheet sheet:0 keys do not match the schema"),
+            "{error}"
+        );
+        assert_eq!(old.encode_state_vector_v1(), before_vector);
+        assert_eq!(old.encode_state_as_update_v1(), before_bytes);
+        assert_eq!(old.model(), &before_model);
+        assert!(!old.has_pending_updates_for_test());
+    }
+
+    #[test]
+    fn flat_hyperlink_keys_refuse_nested_values_unknown_fields_and_excess_entries() {
+        for kind in [0, 1, 2] {
+            let model = rich_model();
+            let authority = WorkbookAuthority::from_model_with_client_id(&model, 240).unwrap();
+            let original = authority.encode_state_as_update_v1();
+            let vector = authority.encode_state_vector_v1();
+            let peer = Doc::with_client_id(241);
+            hydrate_doc(&peer, &original).unwrap();
+            {
+                let mut txn = peer.transact_mut();
+                let sheet = txn
+                    .get_map(SHEETS)
+                    .unwrap()
+                    .get(&txn, "sheet:0")
+                    .unwrap()
+                    .cast::<MapRef>()
+                    .unwrap();
+                match kind {
+                    0 => {
+                        sheet.insert(&mut txn, "hyperlink:A1", MapPrelim::default());
+                    }
+                    1 => {
+                        sheet.try_update(&mut txn, "hyperlinkEdits", false);
+                    }
+                    _ => {
+                        for row in 1..=merges::MAX_MERGE_EDITS_PER_SHEET + 1 {
+                            sheet.try_update(&mut txn, format!("hyperlink:Z{row}"), false);
+                        }
+                    }
+                }
+            }
+            let hostile = WorkbookAuthority::hydrated(peer, authority.base.clone(), 0);
+            let strict = hostile.strict_materialize().unwrap_err();
+            let snapshot = snapshot_validation::validate_for_test(&hostile, model.clone())
+                .unwrap_err()
+                .to_string();
+            if kind != 1 {
+                assert_eq!(strict, snapshot);
+            }
+            if kind == 2 {
+                assert_eq!(strict, "too many sheet hyperlink edits");
+            }
+            assert!(matches!(
+                authority.stage_updates_v1(&[&hostile.encode_state_as_update_v1()], None),
+                Err(AuthorityError::InvalidState(_))
+            ));
+            assert_eq!(authority.encode_state_vector_v1(), vector);
+            assert_eq!(authority.encode_state_as_update_v1(), original);
+            assert_eq!(authority.strict_materialize().unwrap().0, model);
+        }
+    }
+
+    #[test]
+    fn hyperlink_edit_limit_has_identical_strict_and_streaming_projection() {
+        let mut model = WorkbookModel::default();
+        model.sheets.push(Sheet::new("Links"));
+        let authority = WorkbookAuthority::from_model_with_client_id(&model, 250).unwrap();
+        {
+            let mut txn = authority.doc.transact_mut();
+            let sheet = txn
+                .get_map(SHEETS)
+                .unwrap()
+                .get(&txn, "sheet:0")
+                .unwrap()
+                .cast::<MapRef>()
+                .unwrap();
+            for row in 1..=merges::MAX_MERGE_EDITS_PER_SHEET {
+                let address = format!("A{row}");
+                let link = test_hyperlink(&address, "Links!A1");
+                sheet.try_update(
+                    &mut txn,
+                    format!("{HYPERLINK_PREFIX}{address}"),
+                    serde_json::to_string(&link).unwrap(),
+                );
+            }
+        }
+        let projected = authority.strict_materialize().unwrap().0;
+        assert_eq!(
+            projected.sheets[0].hyperlinks.len(),
+            merges::MAX_MERGE_EDITS_PER_SHEET
+        );
+        snapshot_validation::validate_for_test(&authority, projected).unwrap();
+    }
+
+    #[test]
+    fn standalone_full_sync_flattens_hyperlink_edits_into_the_baseline() {
+        let model = rich_model();
+        for full_sync in [false, true] {
+            let mut authority = WorkbookAuthority::from_model_with_client_id(&model, 260).unwrap();
+            let hyperlink = test_hyperlink("J1:K2", "Data!A1");
+            let staged = authority
+                .stage_local_ops_v1(
+                    &[Op::SetHyperlink {
+                        sheet: SheetId(0),
+                        hyperlink: hyperlink.clone(),
+                    }],
+                    SyncOrigin::User,
+                    &model.styles,
+                )
+                .unwrap();
+            authority
+                .apply_local_update_v1(&staged.update, SyncOrigin::User)
+                .unwrap();
+            let expected = if full_sync {
+                authority.strict_materialize().unwrap().0
+            } else {
+                model.clone()
+            };
+            let op = if full_sync {
+                Op::SetHyperlinks {
+                    sheet: SheetId(0),
+                    hyperlinks: expected.sheets[0].hyperlinks.clone(),
+                }
+            } else {
+                Op::RemoveHyperlink {
+                    sheet: SheetId(0),
+                    range: hyperlink.range,
+                }
+            };
+            let flattened = authority
+                .stage_standalone_ops_v1(&[op], SyncOrigin::User, &model.styles, None)
+                .unwrap();
+            authority
+                .apply_local_update_v1(&flattened.update, SyncOrigin::User)
+                .unwrap();
+            assert_eq!(authority.strict_materialize().unwrap().0, expected);
+            let txn = authority.doc.transact();
+            let sheet = txn
+                .get_map(SHEETS)
+                .unwrap()
+                .get(&txn, "sheet:0")
+                .unwrap()
+                .cast::<MapRef>()
+                .unwrap();
+            assert!(sheet.keys(&txn).all(|key| !key.starts_with(HYPERLINK_PREFIX)));
+            let Out::Any(Any::String(baseline)) = sheet.get(&txn, HYPERLINKS).unwrap() else {
+                panic!("missing baseline")
+            };
+            assert_eq!(
+                decode_hyperlinks(&baseline).unwrap(),
+                expected.sheets[0].hyperlinks
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_hyperlink_edit_and_baseline_removal_converge() {
+        let mut model = WorkbookModel::default();
+        let mut sheet = Sheet::new("Baseline");
+        sheet.hyperlinks.push(test_hyperlink("A1", "Baseline!B1"));
+        model.sheets.push(sheet);
+        let mut left = crate::Workbook::from_model_collaborative(model.clone(), 270).unwrap();
+        let mut right = crate::Workbook::from_model_collaborative(model.clone(), 271).unwrap();
+        let vector = left.encode_state_vector_v1();
+        let options = crate::CalculationOptions::default();
+        left.set_hyperlink(SheetId(0), test_hyperlink("A1", "Baseline!C1"), options)
+            .unwrap();
+        right
+            .remove_hyperlink(SheetId(0), CellRange::parse_a1("A1").unwrap(), options)
+            .unwrap();
+        let left_update = left.encode_diff_v1(&vector).unwrap();
+        let right_update = right.encode_diff_v1(&vector).unwrap();
+        left.apply_update_v1(&right_update, options).unwrap();
+        right.apply_update_v1(&left_update, options).unwrap();
+        assert_eq!(left.model(), right.model());
+        assert_eq!(left.encode_state_vector_v1(), right.encode_state_vector_v1());
+        for workbook in [&left, &right] {
+            let doc = Doc::new();
+            hydrate_doc(&doc, &workbook.encode_state_as_update_v1()).unwrap();
+            let authority = WorkbookAuthority::hydrated(
+                doc,
+                Arc::new(WorkbookBase::from_model(&model).unwrap()),
+                0,
+            );
+            snapshot_validation::validate_for_test(&authority, workbook.model().clone()).unwrap();
+            let txn = authority.doc.transact();
+            let sheet = txn
+                .get_map(SHEETS)
+                .unwrap()
+                .get(&txn, "sheet:0")
+                .unwrap()
+                .cast::<MapRef>()
+                .unwrap();
+            let Out::Any(Any::String(baseline)) = sheet.get(&txn, HYPERLINKS).unwrap() else {
+                panic!("missing baseline")
+            };
+            assert_eq!(
+                decode_hyperlinks(&baseline).unwrap(),
+                model.sheets[0].hyperlinks
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_hyperlink_baselines_have_identical_validation() {
+        let mut model = WorkbookModel::default();
+        let mut sheet = Sheet::new("Links");
+        sheet.hyperlinks = vec![
+            test_hyperlink("A1:B2", "Links!D1"),
+            test_hyperlink("B2:C3", "Links!D2"),
+        ];
+        model.sheets.push(sheet);
+        for edited in [false, true] {
+            let authority = WorkbookAuthority::from_model_with_client_id(&model, 280).unwrap();
+            if edited {
+                let mut txn = authority.doc.transact_mut();
+                let sheet = txn
+                    .get_map(SHEETS)
+                    .unwrap()
+                    .get(&txn, "sheet:0")
+                    .unwrap()
+                    .cast::<MapRef>()
+                    .unwrap();
+                sheet.try_update(&mut txn, "hyperlink:A1:B2", false);
+            }
+            let strict = authority.strict_materialize();
+            let snapshot = snapshot_validation::validate_for_test(&authority, model.clone());
+            if edited {
+                assert_eq!(
+                    strict.unwrap_err(),
+                    "cannot edit overlapping imported hyperlinks"
+                );
+                assert_eq!(
+                    snapshot.unwrap_err().to_string(),
+                    "cannot edit overlapping imported hyperlinks"
+                );
+            } else {
+                assert_eq!(strict.unwrap().0, model);
+                snapshot.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn local_hyperlink_edits_remove_shadowed_keys() {
+        let mut model = WorkbookModel::default();
+        model.sheets.push(Sheet::new("Links"));
+        let options = crate::CalculationOptions::default();
+        for remove in [false, true] {
+            let mut left = crate::Workbook::from_model_collaborative(model.clone(), 290).unwrap();
+            let mut right = crate::Workbook::from_model_collaborative(model.clone(), 291).unwrap();
+            for (peer, address) in [(&mut left, "A1:B2"), (&mut right, "B2:C3")] {
+                peer.set_hyperlink(SheetId(0), test_hyperlink(address, "Links!E1"), options)
+                    .unwrap();
+            }
+            left.apply_update_v1(
+                &right
+                    .encode_diff_v1(&left.encode_state_vector_v1())
+                    .unwrap(),
+                options,
+            )
+            .unwrap();
+            assert_eq!(
+                left.model().sheets[0].hyperlinks,
+                vec![test_hyperlink("A1:B2", "Links!E1")]
+            );
+            if remove {
+                left.remove_hyperlink(
+                    SheetId(0),
+                    CellRange::parse_a1("A1:B2").unwrap(),
+                    options,
+                )
+                .unwrap();
+            } else {
+                left.set_hyperlink(SheetId(0), test_hyperlink("B2:D4", "Links!E2"), options)
+                    .unwrap();
+            }
+            right
+                .apply_update_v1(
+                    &left
+                        .encode_diff_v1(&right.encode_state_vector_v1())
+                        .unwrap(),
+                    options,
+                )
+                .unwrap();
+            assert_eq!(left.model(), right.model());
+            let expected = if remove {
+                vec![]
+            } else {
+                vec![test_hyperlink("B2:D4", "Links!E2")]
+            };
+            assert_eq!(left.model().sheets[0].hyperlinks, expected);
+            let doc = Doc::new();
+            hydrate_doc(&doc, &left.encode_state_as_update_v1()).unwrap();
+            let txn = doc.transact();
+            let sheet = txn
+                .get_map(SHEETS)
+                .unwrap()
+                .get(&txn, "sheet:0")
+                .unwrap()
+                .cast::<MapRef>()
+                .unwrap();
+            let keys = sheet
+                .keys(&txn)
+                .filter(|key| key.starts_with(HYPERLINK_PREFIX))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                keys,
+                if remove {
+                    BTreeSet::new()
+                } else {
+                    BTreeSet::from(["hyperlink:B2:D4"])
+                }
+            );
+        }
+    }
+
+    #[test]
     fn malformed_peer_hyperlink_edits_are_refused_without_mutating_the_authority() {
         let model = rich_model();
         let link = serde_json::to_string(&model.sheets[0].hyperlinks[0]).unwrap();
@@ -9109,11 +9426,22 @@ mod tests {
             (212, "A1", Any::from("not json")),
             (213, "A1", Any::from(link.as_str())),
             (214, "A1", Any::Bool(true)),
+            (215, "a1", Any::Bool(false)),
+            (216, "$A$1", Any::Bool(false)),
+            (217, "A1:A1", Any::Bool(false)),
+            (218, "B2:A1", Any::Bool(false)),
+            (219, "XFE1", Any::Bool(false)),
+            (220, "A1048577", Any::Bool(false)),
+            (223, "", Any::Bool(false)),
+            (224, "A1", Any::Null),
+            (225, "A1", Any::from(1)),
+            (226, "A1", Any::from("[]")),
         ] {
             let authority =
                 WorkbookAuthority::from_model_with_client_id(&model, client_id).unwrap();
             let peer = Doc::with_client_id(client_id + 100);
             hydrate_doc(&peer, &authority.encode_state_as_update_v1()).unwrap();
+            let original = authority.encode_state_as_update_v1();
             let before = peer.transact().state_vector();
             {
                 let mut txn = peer.transact_mut_with("test:hostile-hyperlink");
@@ -9122,15 +9450,21 @@ mod tests {
                     .get(&txn, "sheet:0")
                     .and_then(|value| value.cast::<MapRef>().ok())
                     .unwrap();
-                let edits = nested_map(&sheet, &txn, HYPERLINK_EDITS).unwrap();
-                edits.try_update(&mut txn, key, value);
+                sheet.try_update(&mut txn, format!("{HYPERLINK_PREFIX}{key}"), value);
             }
             let update = peer.transact().encode_diff_v1(&before);
+            let hostile = WorkbookAuthority::hydrated(peer, authority.base.clone(), 0);
+            let strict = hostile.strict_materialize().unwrap_err();
+            let snapshot = snapshot_validation::validate_for_test(&hostile, model.clone())
+                .unwrap_err()
+                .to_string();
+            assert_eq!(strict, snapshot);
             assert!(matches!(
                 authority.stage_updates_v1(&[&update], None),
                 Err(AuthorityError::InvalidState(_))
             ));
             assert_eq!(authority.strict_materialize().unwrap().0, model);
+            assert_eq!(authority.encode_state_as_update_v1(), original);
         }
     }
 

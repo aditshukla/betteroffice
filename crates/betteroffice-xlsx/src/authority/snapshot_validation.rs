@@ -38,6 +38,10 @@ pub(crate) struct SnapshotValidation {
     merge_edits: BTreeMap<usize, MergeEdits>,
     merge_projection: Option<MergeProjection>,
     merge_projected: usize,
+    hyperlink_edits: BTreeMap<usize, HyperlinkEdits>,
+    hyperlink_projection: Option<HyperlinkProjection>,
+    hyperlink_baseline: HyperlinkBaseline,
+    hyperlink_projected: usize,
 }
 
 fn invalid() -> SnapshotError {
@@ -820,49 +824,54 @@ impl SnapshotValidation {
                                 self.metadata_child = 0;
                             }
                             HYPERLINKS => {
-                                let json = string(&value)?;
-                                let start = self.json.bytes;
-                                let link = sheet.hyperlinks.get(self.metadata_child);
-                                let (done, bytes) = json_window(
-                                    &mut self.json,
-                                    budget,
-                                    &mut self.unit_bytes,
-                                    |window| {
-                                        if let Some(link) = link {
-                                            window.raw(if self.metadata_child == 0 {
-                                                b"["
+                                if map.keys(&txn).any(|key| key.starts_with(HYPERLINK_PREFIX)) {
+                                    string(&value)?;
+                                    allowance(64, budget, &mut self.unit_bytes)?;
+                                } else {
+                                    let json = string(&value)?;
+                                    let start = self.json.bytes;
+                                    let link = sheet.hyperlinks.get(self.metadata_child);
+                                    let (done, bytes) = json_window(
+                                        &mut self.json,
+                                        budget,
+                                        &mut self.unit_bytes,
+                                        |window| {
+                                            if let Some(link) = link {
+                                                window.raw(if self.metadata_child == 0 {
+                                                    b"["
+                                                } else {
+                                                    b","
+                                                })?;
+                                                window.hyperlink(link)
                                             } else {
-                                                b","
-                                            })?;
-                                            window.hyperlink(link)
-                                        } else {
-                                            window.raw(if self.metadata_child == 0 {
-                                                b"[]"
-                                            } else {
-                                                b"]"
-                                            })
-                                        }
-                                    },
-                                )?;
-                                if json.as_bytes().get(start..self.json.bytes)
-                                    != Some(bytes.as_slice())
-                                {
-                                    return Err(invalid());
+                                                window.raw(if self.metadata_child == 0 {
+                                                    b"[]"
+                                                } else {
+                                                    b"]"
+                                                })
+                                            }
+                                        },
+                                    )?;
+                                    if json.as_bytes().get(start..self.json.bytes)
+                                        != Some(bytes.as_slice())
+                                    {
+                                        return Err(invalid());
+                                    }
+                                    if !done {
+                                        return Ok(false);
+                                    }
+                                    self.json.token = 0;
+                                    self.json.offset = 0;
+                                    if link.is_some() {
+                                        self.metadata_child += 1;
+                                        return Ok(false);
+                                    }
+                                    if json.len() != self.json.bytes {
+                                        return Err(invalid());
+                                    }
+                                    self.metadata_child = 0;
+                                    self.json = JsonPosition::default();
                                 }
-                                if !done {
-                                    return Ok(false);
-                                }
-                                self.json.token = 0;
-                                self.json.offset = 0;
-                                if link.is_some() {
-                                    self.metadata_child += 1;
-                                    return Ok(false);
-                                }
-                                if json.len() != self.json.bytes {
-                                    return Err(invalid());
-                                }
-                                self.metadata_child = 0;
-                                self.json = JsonPosition::default();
                             }
                             _ => return Err(invalid()),
                         }
@@ -1004,7 +1013,9 @@ impl SnapshotValidation {
                     return Ok(false);
                 }
                 if self.field == required.len() + 3 {
-                    if self.version < HYPERLINK_SCHEMA_VERSION {
+                    if self.version < HYPERLINK_SCHEMA_VERSION
+                        && !map.keys(&txn).any(|key| key.starts_with(HYPERLINK_PREFIX))
+                    {
                         let links = base
                             .hyperlinks
                             .get(base_sheet_index(&key).unwrap_or(usize::MAX))
@@ -1269,6 +1280,13 @@ impl SnapshotValidation {
                                                 &value,
                                             )
                                             .map_err(SnapshotError::new)?;
+                                        } else if key.starts_with(HYPERLINK_PREFIX) {
+                                            insert_hyperlink_edit(
+                                                self.hyperlink_edits.entry(sheet_index).or_default(),
+                                                key,
+                                                &value,
+                                            )
+                                            .map_err(SnapshotError::new)?;
                                         } else if !sheet_schema_keys(self.version)
                                             .contains(&key.as_ref())
                                             && !sheet_schema_optional_keys(self.version)
@@ -1385,6 +1403,66 @@ impl SnapshotValidation {
                 }
                 self.merge_projection = None;
                 self.merge_projected = 0;
+                self.metadata_child = 0;
+                self.sheet += 1;
+                return Ok(false);
+            }
+            self.phase = 12;
+            self.sheet = 0;
+            return Ok(false);
+        }
+        if self.phase == 12 {
+            allowance(512, budget, &mut self.unit_bytes)?;
+            if let Some(sheet) = model.sheets.get(self.sheet) {
+                if self.hyperlink_projection.is_none()
+                    && !self.hyperlink_edits.contains_key(&self.sheet)
+                {
+                    self.sheet += 1;
+                    return Ok(false);
+                }
+                let projection = self.hyperlink_projection.get_or_insert_with(|| {
+                    HyperlinkProjection::new(
+                        self.hyperlink_edits.remove(&self.sheet).unwrap_or_default(),
+                    )
+                });
+                let key = self.sheet_keys.get(&self.sheet).ok_or_else(invalid)?;
+                let map = sheets
+                    .get(&txn, key.as_ref())
+                    .and_then(|value| value.cast::<MapRef>().ok())
+                    .ok_or_else(invalid)?;
+                let link = if self.version >= HYPERLINK_SCHEMA_VERSION {
+                    let baseline = atomic(&map, &txn, HYPERLINKS)?;
+                    self.hyperlink_baseline
+                        .next(string(&baseline)?)
+                        .map_err(SnapshotError::new)?
+                } else {
+                    let link = base_sheet_index(key)
+                        .and_then(|index| base.hyperlinks.get(index))
+                        .and_then(|links| links.get(self.metadata_child))
+                        .cloned();
+                    self.metadata_child += usize::from(link.is_some());
+                    link
+                };
+                let next = if let Some(link) = link {
+                    Some(projection.baseline(link).map_err(SnapshotError::new)?)
+                } else {
+                    projection.next_edit()
+                };
+                if let Some(link) = next {
+                    if let Some(link) = link {
+                        if sheet.hyperlinks.get(self.hyperlink_projected) != Some(&link) {
+                            return Err(invalid());
+                        }
+                        self.hyperlink_projected += 1;
+                    }
+                    return Ok(false);
+                }
+                if self.hyperlink_projected != sheet.hyperlinks.len() {
+                    return Err(invalid());
+                }
+                self.hyperlink_projection = None;
+                self.hyperlink_baseline = HyperlinkBaseline::default();
+                self.hyperlink_projected = 0;
                 self.metadata_child = 0;
                 self.sheet += 1;
                 return Ok(false);

@@ -5189,7 +5189,7 @@ impl Workbook {
         let graph = build_graph.then(|| DepGraph::build(&model));
         let mode = match client_id {
             Some(_) => WorkbookMode::Collaborative {
-                structure: authority.structure_oracle().map_err(authority_error)?,
+                structure: Box::new(authority.structure_oracle().map_err(authority_error)?),
             },
             None => WorkbookMode::Standalone,
         };
