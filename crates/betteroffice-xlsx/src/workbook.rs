@@ -692,6 +692,12 @@ impl Workbook {
             validate_collaboration_state_entries(authority.state_vector_entries())?;
         }
         retain_array_formulas(&model, &mut projected);
+        if client_id.is_none() {
+            for (source, target) in model.sheets.iter().zip(&mut projected.sheets) {
+                target.hidden_col_widths = source.hidden_col_widths.clone();
+                target.hidden_row_heights = source.hidden_row_heights.clone();
+            }
+        }
         let model = projected;
         validate_model(&model)?;
         let opened_anchors = model
@@ -2960,7 +2966,11 @@ impl Workbook {
                 | Op::InsertCols { sheet, .. }
                 | Op::DeleteCols { sheet, .. }
                 | Op::SetColWidth { sheet, .. }
+                | Op::SetColVisibility { sheet, .. }
+                | Op::RestoreColDimension { sheet, .. }
                 | Op::SetRowHeight { sheet, .. }
+                | Op::SetRowVisibility { sheet, .. }
+                | Op::RestoreRowDimension { sheet, .. }
                 | Op::SetFreezePane { sheet, .. }
                 | Op::SetHyperlinks { sheet, .. }
                 | Op::RestoreColStyles { sheet, .. }
@@ -3623,6 +3633,30 @@ fn validate_model_sheets(model: &WorkbookModel) -> Result<()> {
                 ));
             }
         }
+        for (&column, &width) in &sheet.hidden_col_widths {
+            if column >= MAX_COLS
+                || !width.is_finite()
+                || !(0.0..=MAX_COL_WIDTH).contains(&width)
+                || width == 0.0
+                || sheet.col_widths.get(&column) != Some(&0.0)
+            {
+                return Err(Error::InvalidOperation(
+                    "workbook contains an invalid hidden column width".to_string(),
+                ));
+            }
+        }
+        for (&row, &height) in &sheet.hidden_row_heights {
+            if row >= MAX_ROWS
+                || !height.is_finite()
+                || !(0.0..=MAX_ROW_HEIGHT).contains(&height)
+                || height == 0.0
+                || sheet.row_heights.get(&row) != Some(&0.0)
+            {
+                return Err(Error::InvalidOperation(
+                    "workbook contains an invalid hidden row height".to_string(),
+                ));
+            }
+        }
         for (index, range) in sheet.merges.iter().enumerate() {
             validate_range(*range)?;
             if sheet.merges[index + 1..]
@@ -3676,7 +3710,11 @@ fn worksheet_edit_target(op: &Op) -> Option<SheetId> {
         | Op::InsertCols { sheet, .. }
         | Op::DeleteCols { sheet, .. }
         | Op::SetColWidth { sheet, .. }
+        | Op::SetColVisibility { sheet, .. }
+        | Op::RestoreColDimension { sheet, .. }
         | Op::SetRowHeight { sheet, .. }
+        | Op::SetRowVisibility { sheet, .. }
+        | Op::RestoreRowDimension { sheet, .. }
         | Op::SetFreezePane { sheet, .. }
         | Op::SetHyperlinks { sheet, .. }
         | Op::RestoreColStyles { sheet, .. }
@@ -3737,6 +3775,36 @@ fn validate_op(model: &WorkbookModel, op: &Op) -> Result<()> {
                 )));
             }
         }
+        Op::SetColVisibility { sheet, col, .. } => {
+            require_sheet(model, *sheet)?;
+            if *col >= MAX_COLS {
+                return Err(Error::InvalidOperation(format!(
+                    "column {} is out of range",
+                    u64::from(*col) + 1
+                )));
+            }
+        }
+        Op::RestoreColDimension {
+            sheet,
+            col,
+            width,
+            hidden_width,
+        } => {
+            require_sheet(model, *sheet)?;
+            if *col >= MAX_COLS
+                || width.is_some_and(|value| {
+                    !value.is_finite() || !(0.0..=MAX_COL_WIDTH).contains(&value)
+                })
+                || hidden_width.is_some_and(|value| {
+                    !value.is_finite() || !(0.0..=MAX_COL_WIDTH).contains(&value) || value == 0.0
+                })
+                || hidden_width.is_some() && *width != Some(0.0)
+            {
+                return Err(Error::InvalidOperation(
+                    "invalid column dimension restore".to_string(),
+                ));
+            }
+        }
         Op::SetRowHeight { sheet, row, height } => {
             require_sheet(model, *sheet)?;
             if *row >= MAX_ROWS {
@@ -3751,6 +3819,36 @@ fn validate_op(model: &WorkbookModel, op: &Op) -> Result<()> {
                 return Err(Error::InvalidOperation(format!(
                     "row height must be between 0 and {MAX_ROW_HEIGHT}"
                 )));
+            }
+        }
+        Op::SetRowVisibility { sheet, row, .. } => {
+            require_sheet(model, *sheet)?;
+            if *row >= MAX_ROWS {
+                return Err(Error::InvalidOperation(format!(
+                    "row {} is out of range",
+                    u64::from(*row) + 1
+                )));
+            }
+        }
+        Op::RestoreRowDimension {
+            sheet,
+            row,
+            height,
+            hidden_height,
+        } => {
+            require_sheet(model, *sheet)?;
+            if *row >= MAX_ROWS
+                || height.is_some_and(|value| {
+                    !value.is_finite() || !(0.0..=MAX_ROW_HEIGHT).contains(&value)
+                })
+                || hidden_height.is_some_and(|value| {
+                    !value.is_finite() || !(0.0..=MAX_ROW_HEIGHT).contains(&value) || value == 0.0
+                })
+                || hidden_height.is_some() && *height != Some(0.0)
+            {
+                return Err(Error::InvalidOperation(
+                    "invalid row dimension restore".to_string(),
+                ));
             }
         }
         Op::SetFreezePane { sheet, pane } => {
@@ -4235,16 +4333,36 @@ fn validate_cell_state(state: &CellState) -> Result<()> {
     Ok(())
 }
 
+/// The style a write leaves on `cell`: its own, or for a missing cell its row's or column's
+/// default. A clear leaves a missing cell missing and pins an unstyled cell to the default
+/// style where a row or column default would otherwise take over.
+fn written_cell_style(
+    workbook: &WorkbookModel,
+    sheet: SheetId,
+    cell: CellRef,
+    clears: bool,
+) -> Option<u32> {
+    let sheet = workbook.sheet(sheet);
+    let inherited = sheet.and_then(|sheet| sheet.inherited_style(cell));
+    match sheet.and_then(|sheet| sheet.cell(cell)) {
+        None if clears => None,
+        None => inherited,
+        Some(existing) if clears && existing.style.is_none() => inherited
+            .is_some_and(|inherited| inherited != 0)
+            .then_some(0),
+        Some(existing) => existing.style,
+    }
+}
+
 fn edit_cell_state(
     workbook: &WorkbookModel,
     sheet: SheetId,
     cell: CellRef,
     input: &str,
 ) -> CellState {
-    let sheet = workbook.sheet(sheet);
-    let existing = sheet.and_then(|sheet| sheet.cell(cell));
-    let inherited = sheet.and_then(|sheet| sheet.inherited_style(cell));
-    let style = existing.map_or(inherited, |existing| existing.style);
+    let style = workbook
+        .sheet(sheet)
+        .and_then(|sheet| sheet.effective_style(cell));
     let number_format = workbook
         .styles
         .resolved_format(Some(style.unwrap_or(0)))
@@ -4263,13 +4381,7 @@ fn edit_cell_state(
     } else {
         cell_state_for_input_no_eval(input)
     };
-    state.style = match existing {
-        None if input.is_empty() => None,
-        Some(_) if input.is_empty() && style.is_none() => inherited
-            .is_some_and(|inherited| inherited != 0)
-            .then_some(0),
-        _ => style,
-    };
+    state.style = written_cell_style(workbook, sheet, cell, input.is_empty());
     state
 }
 
@@ -4303,6 +4415,8 @@ fn models_semantically_equal(left: &WorkbookModel, right: &WorkbookModel) -> boo
             || left.merges != right.merges
             || left.col_widths != right.col_widths
             || left.row_heights != right.row_heights
+            || left.hidden_col_widths != right.hidden_col_widths
+            || left.hidden_row_heights != right.hidden_row_heights
         {
             return false;
         }
@@ -4716,7 +4830,12 @@ impl CalculationScope {
             // history may have changed in more than their sheet names
             Op::RestoreSheet { .. } => Self::Full,
             // a zero size hides a row or column, which hidden-aware functions read
-            Op::SetColWidth { .. } | Op::SetRowHeight { .. } => Self::Full,
+            Op::SetColWidth { .. }
+            | Op::SetColVisibility { .. }
+            | Op::RestoreColDimension { .. }
+            | Op::SetRowHeight { .. }
+            | Op::SetRowVisibility { .. }
+            | Op::RestoreRowDimension { .. } => Self::Full,
             Op::SetDefinedNames { .. }
             | Op::AddSheet { .. }
             | Op::RemoveSheet { .. }
@@ -4995,6 +5114,12 @@ impl Workbook {
         }
         let mut projected = authority.materialize_oracle().map_err(authority_error)?;
         retain_array_formulas(&model, &mut projected);
+        if client_id.is_none() {
+            for (source, target) in model.sheets.iter().zip(&mut projected.sheets) {
+                target.hidden_col_widths = source.hidden_col_widths.clone();
+                target.hidden_row_heights = source.hidden_row_heights.clone();
+            }
+        }
         let model = projected;
         validate_model(&model)?;
         let opened_anchors = model
