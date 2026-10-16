@@ -607,17 +607,18 @@ pub(crate) fn argument_cells(
     ctx: &EvalContext<'_>,
 ) -> Result<(Vec<CellValue>, bool), ErrorValue> {
     if let Some(area) = as_area(arg, ctx) {
-        let cells = area
-            .values_ref(ctx)?
-            .into_iter()
-            .map(std::borrow::Cow::into_owned)
-            .collect();
+        let mut cells = Vec::new();
+        for cell in area.values_ref(ctx)? {
+            if !ctx.keep_text(&cell) {
+                return Err(ErrorValue::Num);
+            }
+            cells.push(cell.into_owned());
+        }
         return Ok((cells, true));
     }
     let cells = crate::array::evaluate_array(arg, ctx)
         .into_array()
-        .cells()
-        .to_vec();
+        .into_values();
     let from_sheet = cells.len() > 1;
     Ok((cells, from_sheet))
 }
@@ -763,8 +764,8 @@ pub(crate) fn nth_int(args: &[Expr], ctx: &EvalContext<'_>, i: usize) -> Result<
 /// like [`nth_int`], but a computed index that scalar evaluation cannot read
 /// is retried in array mode. the reference builtins resolve inside array
 /// formulas too, where `MATCH(0,LEN(range),0)` only means anything
-/// elementwise. a reference argument keeps its scalar answer, so this never
-/// turns excel's implicit intersection into a silent first-cell read.
+/// elementwise. a reference argument keeps its scalar answer, the implicit
+/// intersection a scalar formula reads, never a silent first-cell read.
 pub(crate) fn nth_int_lifted(
     args: &[Expr],
     ctx: &EvalContext<'_>,

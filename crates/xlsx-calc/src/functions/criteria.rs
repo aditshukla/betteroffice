@@ -161,27 +161,28 @@ fn cell_text_lower(v: &CellValue) -> String {
     }
 }
 
-/// any metacharacter routes through the glob matcher — even fully-escaped
-/// patterns, since `~` still has to be unescaped.
 fn has_wildcard(s: &str) -> bool {
-    s.contains(['*', '?', '~'])
+    s.contains(['*', '?']) || s.contains("~~")
 }
 
-/// glob match with `*` and `?`; `~` escapes the following metacharacter.
-/// pattern and text are already lowercased.
+/// match lowercased text with `*`, `?`, and tilde escapes.
 pub(crate) fn wildcard_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
     let (mut star_p, mut star_t): (Option<usize>, usize) = (None, 0);
     while ti < t.len() {
-        let (lit, is_star, is_any) = classify(&p, pi);
-        if is_star {
+        let (ch, width) = match &p[pi..] {
+            ['~', ch @ ('*' | '?' | '~'), ..] => (Some(*ch), 2),
+            [ch, ..] => (Some(*ch), 1),
+            [] => (None, 0),
+        };
+        if ch == Some('*') && width == 1 {
             star_p = Some(pi);
             star_t = ti;
             pi += 1;
-        } else if pi < p.len() && (is_any || lit == Some(t[ti])) {
-            pi += advance(&p, pi);
+        } else if ch == Some(t[ti]) || (ch == Some('?') && width == 1) {
+            pi += width;
             ti += 1;
         } else if let Some(sp) = star_p {
             pi = sp + 1;
@@ -191,30 +192,7 @@ pub(crate) fn wildcard_match(pattern: &str, text: &str) -> bool {
             return false;
         }
     }
-    while pi < p.len() {
-        let (_, is_star, _) = classify(&p, pi);
-        if !is_star {
-            return false;
-        }
-        pi += 1;
-    }
-    true
-}
-
-/// interpret the pattern element at `pi`: (literal char, is `*`, is `?`).
-fn classify(p: &[char], pi: usize) -> (Option<char>, bool, bool) {
-    match p.get(pi) {
-        Some('~') => (p.get(pi + 1).copied(), false, false),
-        Some('*') => (None, true, false),
-        Some('?') => (None, false, true),
-        Some(&c) => (Some(c), false, false),
-        None => (None, false, false),
-    }
-}
-
-/// how many pattern chars a single match consumes (2 for an escape `~x`).
-fn advance(p: &[char], pi: usize) -> usize {
-    if p.get(pi) == Some(&'~') { 2 } else { 1 }
+    p[pi..].iter().all(|&ch| ch == '*')
 }
 
 /// build a criterion from a criteria argument's evaluated value.
@@ -222,12 +200,38 @@ pub(crate) fn criterion_from_arg(arg: &Expr, ctx: &EvalContext<'_>) -> Criterion
     Criterion::from_value(&evaluate(arg, ctx))
 }
 
-/// parse a `range, criteria, ...` tail into aligned (area, criterion) pairs;
-/// `None` on an odd count, a non-reference range, or a shape mismatch.
+/// the criteria of a `...IFS` call, cut to the extent the data reaches.
+pub(crate) struct Criteria {
+    pub pairs: Vec<(Area, Criterion)>,
+    /// the range the call aggregates, cut and aligned with the criteria.
+    pub values: Option<Area>,
+    /// cells each criteria range holds past the cut, all of them blank.
+    pub unread: u64,
+}
+
+impl Criteria {
+    /// how many of the unread blanks satisfy every criterion: all or none.
+    pub(crate) fn unread_matches(&self) -> u64 {
+        if self
+            .pairs
+            .iter()
+            .all(|(_, criterion)| criterion.matches(&CellValue::Empty))
+        {
+            self.unread
+        } else {
+            0
+        }
+    }
+}
+
+/// parse a `range, criteria, ...` tail into aligned (area, criterion) pairs,
+/// with `values` aligned to them when given; `None` on an odd count, a
+/// non-reference range, or a shape mismatch.
 pub(crate) fn collect_pairs(
     specs: &[Expr],
+    values: Option<&Expr>,
     ctx: &EvalContext<'_>,
-) -> Option<Vec<(Area, Criterion)>> {
+) -> Option<Criteria> {
     if specs.is_empty() || !specs.len().is_multiple_of(2) {
         return None;
     }
@@ -235,18 +239,44 @@ pub(crate) fn collect_pairs(
     for chunk in specs.chunks(2) {
         areas.push(as_area(&chunk[0], ctx)?);
     }
-    bound_together(&mut areas, ctx);
-    let dims = (areas[0].rows, areas[0].cols);
-    if areas.iter().any(|area| (area.rows, area.cols) != dims) {
+    let first = areas[0];
+    if areas
+        .iter()
+        .any(|area| (area.rows, area.cols) != (first.rows, first.cols))
+    {
         return None;
     }
-    Some(
-        areas
-            .into_iter()
-            .zip(specs.chunks(2))
-            .map(|(area, chunk)| (area, criterion_from_arg(&chunk[1], ctx)))
-            .collect(),
-    )
+    let count = areas.len();
+    if let Some(values) = values {
+        areas.push(aligned(as_area(values, ctx)?, first.rows, first.cols)?);
+    }
+    bound_together(&mut areas, ctx);
+    let values = values.map(|_| areas[count]);
+    areas.truncate(count);
+    let unread = first.unread(areas[0].cell_count().unwrap_or(0));
+    let pairs = areas
+        .into_iter()
+        .zip(specs.chunks(2))
+        .map(|(area, chunk)| (area, criterion_from_arg(&chunk[1], ctx)))
+        .collect();
+    Some(Criteria {
+        pairs,
+        values,
+        unread,
+    })
+}
+
+/// the range and value range of a `SUMIF`/`AVERAGEIF`, cut together. the value
+/// range keeps its top-left and takes the range's shape, as excel resizes it.
+pub(crate) fn single_pair(range: Area, values: Area, ctx: &EvalContext<'_>) -> (Area, Area) {
+    let values = Area {
+        rows: range.rows,
+        cols: range.cols,
+        ..values
+    };
+    let mut areas = [range, values];
+    bound_together(&mut areas, ctx);
+    (areas[0], areas[1])
 }
 
 /// cut whole-column and whole-row criteria to the data they cover, giving
@@ -278,15 +308,18 @@ pub(crate) fn bound_together(areas: &mut [Area], ctx: &EvalContext<'_>) {
     }
 }
 
+/// `bound_together` over the arguments that are references.
+pub(crate) fn cut_references(areas: &mut [Option<Area>], ctx: &EvalContext<'_>) {
+    let mut cut: Vec<Area> = areas.iter().flatten().copied().collect();
+    bound_together(&mut cut, ctx);
+    for (area, cut) in areas.iter_mut().flatten().zip(cut) {
+        *area = cut;
+    }
+}
+
 /// the values a `...IF`/`...IFS` aggregates, cut to the criteria rectangle: a
 /// whole-column range simply takes the criteria shape.
-pub(crate) fn aligned_area(
-    expr: &Expr,
-    ctx: &EvalContext<'_>,
-    rows: usize,
-    cols: usize,
-) -> Option<Area> {
-    let mut area = as_area(expr, ctx)?;
+pub(crate) fn aligned(mut area: Area, rows: usize, cols: usize) -> Option<Area> {
     if area.rows >= xlsx_model::MAX_ROWS as usize {
         area.rows = rows;
     }
@@ -364,6 +397,58 @@ mod tests {
         assert!(Criterion::parse("<>apple").matches(&txt("pear")));
         assert!(Criterion::parse("a~*").matches(&txt("a*")));
         assert!(!Criterion::parse("a~*").matches(&txt("ab")));
+    }
+
+    #[test]
+    fn tilde_escapes_only_wildcard_metacharacters() {
+        assert!(Criterion::parse("~a").matches(&txt("~a")));
+        assert!(!Criterion::parse("~a").matches(&txt("a")));
+        assert!(Criterion::parse("~").matches(&txt("~")));
+        assert!(!Criterion::parse("~").matches(&txt("")));
+        assert!(Criterion::parse("~~").matches(&txt("~")));
+        assert!(Criterion::parse("~*").matches(&txt("*")));
+        assert!(Criterion::parse("~?").matches(&txt("?")));
+    }
+
+    #[test]
+    fn tilde_patterns_preserve_literals_and_escape_pairs() {
+        for (pattern, text, expected) in [
+            ("*~a", "prefix~a", true),
+            ("*~a", "prefixa", false),
+            ("*~", "prefix~", true),
+            ("*~", "prefix", false),
+            ("?~", "é~", true),
+            ("?~", "é", false),
+            ("~é*", "~éclair", true),
+            ("~é*", "éclair", false),
+            ("~~", "~~", false),
+            ("~~~", "~~", true),
+            ("~~~", "~", false),
+            ("~~~~", "~~", true),
+            ("~~*", "~suffix", true),
+            ("~~*", "suffix", false),
+            ("~~~*", "~*", true),
+            ("~~~*", "~suffix", false),
+            ("~~~?", "~?", true),
+            ("~~~?", "~x", false),
+            ("~*", "~anything", false),
+            ("~?", "~x", false),
+            ("*~*?~", "a*b*c~", true),
+            ("*~*?~", "a*b*c", false),
+        ] {
+            assert_eq!(
+                wildcard_match(pattern, text),
+                expected,
+                "{pattern:?} against {text:?}"
+            );
+            for (prefix, expected) in [("", expected), ("=", expected), ("<>", !expected)] {
+                assert_eq!(
+                    Criterion::parse(&format!("{prefix}{pattern}")).matches(&txt(text)),
+                    expected,
+                    "{prefix}{pattern:?} against {text:?}"
+                );
+            }
+        }
     }
 
     #[test]

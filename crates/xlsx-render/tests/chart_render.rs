@@ -69,6 +69,7 @@ fn absolute_chart() -> SheetChart {
 fn is_chart_command(command: &DrawCmd) -> bool {
     match command {
         DrawCmd::FillRect { clip, .. }
+        | DrawCmd::PatternFill { clip, .. }
         | DrawCmd::Line { clip, .. }
         | DrawCmd::Path { clip, .. } => clip.is_some(),
         DrawCmd::Text { chart, .. } => *chart,
@@ -373,7 +374,7 @@ fn an_unsupported_family_degrades_to_a_placeholder() {
 }
 
 #[test]
-fn an_unsupported_feature_degrades_to_a_placeholder() {
+fn a_dangling_axis_reference_on_a_stacked_chart_degrades_to_a_placeholder() {
     let display_list = frame_with_one_chart(|_| {
         Ok(Arc::new(ChartSpace {
             title: Some("Spend".into()),
@@ -381,6 +382,7 @@ fn an_unsupported_feature_degrades_to_a_placeholder() {
             plot_groups: vec![ChartPlotGroup {
                 chart_type: Some("column".into()),
                 grouping: Some("percentStacked".into()),
+                axis_ids: vec!["missing".into()],
                 series: vec![ChartSeries {
                     name: Some("Total".into()),
                     categories: vec!["All".into()],

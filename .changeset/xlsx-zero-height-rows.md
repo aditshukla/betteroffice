@@ -1,7 +1,6 @@
 ---
-'@betteroffice/xlsx': patch
-'@betteroffice/rust-crates': patch
-'@betteroffice/python-xlsx': patch
+"@betteroffice/xlsx": patch
+"@betteroffice/rust-crates": patch
 ---
 
-xlsx: a sheet declaring `sheetFormatPr/@zeroHeight` now hides the rows that carry no height of their own, as Excel does. The attribute was read nowhere, so those rows took a fitted or default height and rendered visible.
+Rows with cells, a row style or an explicit height stay visible when a sheet hides unused rows by default (`zeroHeight`). Empty rows remain hidden, and collaboration snapshots remain compatible.

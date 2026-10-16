@@ -417,6 +417,39 @@ export function resolveMetricCompatFace(
   );
 }
 
+const bundledFamilyByName = new Map(
+  BUNDLED_FONTS.map((face) => [face.family.toLowerCase(), face.family]),
+);
+
+/** Serif Noto families this package does not vendor; the same region's sans face covers them. */
+const UNVENDORED_NOTO_SERIF: Record<string, string> = {
+  'noto serif tc': 'Noto Sans TC',
+  'noto serif jp': 'Noto Sans JP',
+  'noto serif kr': 'Noto Sans KR',
+};
+
+/**
+ * Resolve a family by its bundled name (`"Gelasio"`, `"Noto Sans SC"`) or as a
+ * Word family, returning only a face whose weight and style match, so a
+ * browser can synthesize the styles a family does not ship.
+ */
+export function resolveBundledFamilyFace(
+  family: string,
+  bold: boolean,
+  italic: boolean,
+): BundledFontFace | undefined {
+  const key = family.trim().toLowerCase();
+  const bundled =
+    bundledFamilyByName.get(key) ??
+    UNVENDORED_NOTO_SERIF[key] ??
+    resolveMetricCompatFamily(family);
+  const weight = bold ? 700 : 400;
+  const style = italic ? 'italic' : 'normal';
+  return BUNDLED_FONTS.find(
+    (f) => f.family === bundled && f.weight === weight && f.style === style,
+  );
+}
+
 /**
  * Pick the bundled face that provides glyph coverage for a script bucket.
  * Preference order: exact (weight, style) -> same weight upright -> the
@@ -480,18 +513,23 @@ function looksSerif(family: string): boolean {
   );
 }
 
-/**
- * A family no clone matches, paired with the bundled face whose advance widths
- * come closest: Montserrat is within 0.3% of Verdana over a sentence of
- * mixed-case text, where Calibri is 24% too narrow, and it keeps the line
- * breaks the deck was written against. Measured the same way, Trebuchet MS,
- * Tahoma, Century Gothic, Tw Cen MT and Lucida Grande all scored worse on the
- * corpus than plain Calibri does, so they are deliberately left out — a closer
- * advance is not worth a letterform that far off (#797).
- */
-const WIDTH_MATCHED_SUBSTITUTES: Record<string, string> = {
-  verdana: 'Montserrat',
-};
+/** Matching total text widths does not guarantee matching individual digit widths. */
+const WIDTH_MATCHED_SUBSTITUTES = new Map<
+  string,
+  {
+    family: string;
+    digitAdvances: Partial<Record<'regular' | 'bold' | 'italic' | 'boldItalic', number>>;
+  }
+>([
+  ['verdana', {
+    family: 'Montserrat',
+    digitAdvances: { regular: 0.636, bold: 0.711, italic: 0.636, boldItalic: 0.711 },
+  }],
+]);
+
+function resolveWidthMatchedSubstitute(family: string) {
+  return WIDTH_MATCHED_SUBSTITUTES.get(family.trim().toLowerCase());
+}
 
 /**
  * `Calibri Light` and `Inter Light` are families of their own on the machine
@@ -558,20 +596,26 @@ function heavyVariantOf(family: string, italic: boolean): BundledFontFace | unde
   return resolveMetricCompatFace(words.slice(0, -1).join(' '), true, italic);
 }
 
+/** The Office application whose font substitution a last-resort pick follows. */
+export type LastResortOffice = 'powerpoint' | 'word';
+
 /**
  * Choose a related family, then a serif or sans fallback.
  *
- * The sans fallback is Calibri because that is what Office substitutes for a
- * family it cannot find: a deck asking for Google Sans, Inter or Questrial is
- * drawn in Calibri, which is ~7% narrower than Arial, so falling back to Arial
- * rewraps every line the document wrote against those metrics. A heavy weight
- * in the name is read only for a family we bundle: Office substitutes
- * `Archivo Black` with a regular face, and matching that keeps the line breaks.
+ * The sans fallback follows the application that drew the file. PowerPoint
+ * substitutes Calibri for a family it cannot find: a deck asking for Google
+ * Sans, Inter or Questrial is drawn in Calibri, which is ~7% narrower than
+ * Arial, so falling back to Arial rewraps every line the deck wrote against
+ * those metrics. Word substitutes Arial, and a document paginated against
+ * Arial loses pages when drawn in Calibri. A heavy weight in the name is read
+ * only for a family we bundle: Office substitutes `Archivo Black` with a
+ * regular face, and matching that keeps the line breaks.
  */
 export function resolveLastResortFace(
   family: string,
   bold: boolean,
   italic: boolean,
+  office: LastResortOffice = 'powerpoint',
 ): BundledFontFace {
   const light = lightVariantOf(family, italic);
   if (light) return light;
@@ -580,11 +624,35 @@ export function resolveLastResortFace(
   if (looksMono(family)) {
     return resolveMetricCompatFace('Courier New', bold, italic)!;
   }
-  const matched = WIDTH_MATCHED_SUBSTITUTES[family.trim().toLowerCase()];
+  const matched = resolveWidthMatchedSubstitute(family);
   if (matched) {
-    const face = resolveMetricCompatFace(matched, bold, italic);
+    const face = resolveMetricCompatFace(matched.family, bold, italic);
     if (face) return face;
   }
-  const base = looksSerif(family) ? 'Times New Roman' : 'Calibri';
+  const sans = office === 'word' ? 'Arial' : 'Calibri';
+  const base = looksSerif(family) ? 'Times New Roman' : sans;
   return resolveMetricCompatFace(base, bold, italic)!;
+}
+
+/** Recorded widest digit advance in em for the requested family and style. */
+export function resolveDigitAdvance(
+  family: string,
+  bold = false,
+  italic = false,
+): number | undefined {
+  const style = bold ? (italic ? 'boldItalic' : 'bold') : (italic ? 'italic' : 'regular');
+  return resolveWidthMatchedSubstitute(family)?.digitAdvances[style];
+}
+
+/** Widest digit advance in whole pixels for spreadsheet column widths. */
+export function maxDigitWidth(
+  family: string,
+  sizePx: number,
+  measure: (digit: string) => number,
+  bold = false,
+  italic = false,
+): number {
+  const advance = resolveDigitAdvance(family, bold, italic);
+  if (advance !== undefined) return Math.round(advance * sizePx);
+  return Math.max(...[...'0123456789'].map((digit) => Math.round(measure(digit))));
 }

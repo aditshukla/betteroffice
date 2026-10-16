@@ -32,7 +32,7 @@ fn table_lookup(args: &[Expr], ctx: &EvalContext<'_>, vertical: bool) -> CellVal
         return err(value);
     }
     let area = match crate::eval::required_area(&args[1], ctx) {
-        Ok(a) => crate::eval::bound_area(a, ctx),
+        Ok(a) => a,
         Err(error) => return err(error),
     };
     let index = match nth_int(args, ctx, 2) {
@@ -50,10 +50,13 @@ fn table_lookup(args: &[Expr], ctx: &EvalContext<'_>, vertical: bool) -> CellVal
     } else {
         true
     };
+    // the search stops where the sheet's data does, but the index may still
+    // reach past it into blanks
+    let searched = crate::eval::bound_area(area, ctx);
     let (lines, depth) = if vertical {
-        (area.rows, area.cols)
+        (searched.rows, area.cols)
     } else {
-        (area.cols, area.rows)
+        (searched.cols, area.rows)
     };
     if index as usize > depth {
         return err(ErrorValue::Ref);
@@ -372,8 +375,10 @@ pub(crate) fn indirect_area(args: &[Expr], ctx: &EvalContext<'_>) -> Result<Area
         return Err(ErrorValue::Value);
     }
     if let Some(style) = args.get(1) {
-        // a bad a1 argument is the caller's error, not a silent A1 default
+        // a bad a1 argument is the caller's error, not a silent A1 default;
+        // R1C1 text is an engine gap
         if !crate::eval::to_bool(&evaluate(style, ctx))? {
+            ctx.record_unsupported_function();
             return Err(ErrorValue::Ref);
         }
     }
@@ -382,11 +387,23 @@ pub(crate) fn indirect_area(args: &[Expr], ctx: &EvalContext<'_>) -> Result<Area
         CellValue::Error { value } => return Err(value),
         _ => return Err(ErrorValue::Ref),
     };
-    let expr = crate::parse_formula(&text).map_err(|_| ErrorValue::Ref)?;
+    let expr = crate::parse_formula(&text).map_err(|_| {
+        if text.contains('[') {
+            ctx.record_unsupported_function();
+        }
+        ErrorValue::Ref
+    })?;
     if !matches!(
         expr,
         Expr::Ref { .. } | Expr::Range { .. } | Expr::ColumnRange { .. } | Expr::RowRange { .. }
     ) {
+        if let Expr::Name {
+            scope: Some(scope), ..
+        } = &expr
+            && scope.contains('[')
+        {
+            ctx.record_unsupported_function();
+        }
         return Err(ErrorValue::Ref);
     }
     as_area(&expr, ctx).ok_or(ErrorValue::Ref)
@@ -726,8 +743,8 @@ pub(crate) fn address(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
         )
     };
     match sheet {
-        Some(name) => crate::eval::text(format!("{}!{}", quoted_sheet(&name), body)),
-        None => crate::eval::text(body),
+        Some(name) => crate::eval::text(ctx, format!("{}!{}", quoted_sheet(&name), body)),
+        None => crate::eval::text(ctx, body),
     }
 }
 
@@ -773,7 +790,7 @@ pub(crate) fn hyperlink(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
     };
     match shown {
         CellValue::Error { value } => err(value),
-        CellValue::Empty => crate::eval::text(""),
+        CellValue::Empty => crate::eval::text(ctx, ""),
         value => value,
     }
 }
