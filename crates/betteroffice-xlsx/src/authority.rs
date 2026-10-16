@@ -8330,7 +8330,7 @@ mod tests {
             }
             let mut authority = WorkbookAuthority::from_model_with_client_id(&model, 119).unwrap();
             let mut oracle =
-                WorkbookAuthority::from_source_oracle(&model, Some(119), &[], None).unwrap();
+                WorkbookAuthority::from_source_oracle(&model, Some(119), &[], None, &[]).unwrap();
             assert_eq!(authority.schema_version().unwrap(), 6);
             assert_eq!(authority.base.fingerprint, oracle.base.fingerprint);
             assert_eq!(
