@@ -5924,6 +5924,10 @@ fn concurrent_disjoint_merges_on_one_sheet_converge_without_loss() {
 
 #[test]
 fn concurrent_overlapping_merges_choose_the_same_range_and_survive_reopen() {
+    let snapshot = |workbook: &Workbook| {
+        let update = YrsUpdate::decode_v1(&workbook.encode_state_as_update_v1()).unwrap();
+        yrs::Snapshot::new(update.state_vector(), update.delete_set().clone())
+    };
     let bytes = sample_xlsx();
     let options = CalculationOptions::default();
     let mut left = Workbook::open_collaborative(&bytes, 1105).unwrap();
@@ -5966,7 +5970,27 @@ fn concurrent_overlapping_merges_choose_the_same_range_and_survive_reopen() {
         vec![first]
     );
 
+    let vector = right.encode_state_vector_v1();
     right.undo(options).unwrap();
+    assert_eq!(right.encode_state_vector_v1(), vector);
+    let undo_update = right
+        .encode_diff_v1(&left.encode_state_vector_v1())
+        .unwrap();
+    assert!(left.apply_update_v1(&undo_update, options).unwrap().applied);
+    assert_eq!(left.model(), right.model());
+    assert_eq!(left.model().sheets[0].merges, vec![first]);
+    assert_eq!(snapshot(&left), snapshot(&right));
+    assert!(!left.apply_update_v1(&undo_update, options).unwrap().applied);
+
+    assert!(left.undo(options).unwrap().applied);
+    right
+        .apply_update_v1(
+            &left
+                .encode_diff_v1(&right.encode_state_vector_v1())
+                .unwrap(),
+            options,
+        )
+        .unwrap();
     left.apply_update_v1(
         &right
             .encode_diff_v1(&left.encode_state_vector_v1())
@@ -5974,8 +5998,12 @@ fn concurrent_overlapping_merges_choose_the_same_range_and_survive_reopen() {
         options,
     )
     .unwrap();
-    assert_eq!(left.model(), right.model());
-    assert_eq!(left.model().sheets[0].merges, vec![first]);
+    assert_eq!(
+        left.model().sheets[0].merges,
+        right.model().sheets[0].merges
+    );
+    assert_eq!(snapshot(&left), snapshot(&right));
+    assert!(left.model().sheets[0].merges.is_empty());
 }
 
 #[test]

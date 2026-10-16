@@ -1457,17 +1457,13 @@ impl WorkbookAuthority {
         let staged_doc = Doc::with_client_id(self.client_id());
         hydrate_local_doc(&staged_doc, before).map_err(AuthorityError::InvalidState)?;
         let known = staged_doc.transact().state_vector();
-        let held_back = match hold_back_unreachable_v1(bytes, &layout, &known) {
+        let (held_back, applied_deletes) = match hold_back_unreachable_v1(bytes, &layout, &known) {
             Some(reachable) => {
                 let reachable =
                     decode_local_update_v1(&reachable).map_err(AuthorityError::InvalidUpdate)?;
-                apply_remote(&staged_doc, reachable)?;
-                true
+                (true, apply_remote(&staged_doc, reachable)?)
             }
-            None => {
-                apply_remote(&staged_doc, incoming)?;
-                false
-            }
+            None => (false, apply_remote(&staged_doc, incoming)?),
         };
 
         let staged = Self::hydrated(staged_doc, self.base.clone(), self.next_sheet_id);
@@ -1481,16 +1477,12 @@ impl WorkbookAuthority {
         let integrated = staged.doc.transact().encode_diff_v1(&before_vector);
         let after_vector = staged.doc.transact().state_vector();
         let state_vector_entries = after_vector.len();
-        // The current state only needs materializing when the state vectors
-        // match: a differing vector already proves the update changed
-        // something, while an equal one can still hide a delete-set change, so
-        // the models must actually be compared there.
         if pending {
             let mut current = None;
             if integrated.as_slice() != Update::EMPTY_V1
                 && let Ok((model, structure)) = staged.strict_materialize()
             {
-                let effective = after_vector != before_vector || {
+                let effective = after_vector != before_vector || applied_deletes || {
                     let state = self
                         .strict_materialize()
                         .map_err(AuthorityError::InvalidState)?;
@@ -1531,7 +1523,7 @@ impl WorkbookAuthority {
         let (model, structure) = staged
             .strict_materialize()
             .map_err(AuthorityError::InvalidState)?;
-        let effective = after_vector != before_vector || {
+        let effective = after_vector != before_vector || applied_deletes || {
             let (current_model, current_structure) = self
                 .strict_materialize()
                 .map_err(AuthorityError::InvalidState)?;
@@ -2677,10 +2669,11 @@ pub(crate) fn hydrate_snapshot_part(doc: &Doc, update: &[u8]) -> Result<(), Stri
     hydrate_local_doc(doc, update)
 }
 
-fn apply_remote(doc: &Doc, update: Update) -> Result<(), AuthorityError> {
-    doc.transact_mut_with(REMOTE_ORIGIN)
-        .apply_update(update)
-        .map_err(|error| AuthorityError::InvalidUpdate(error.to_string()))
+fn apply_remote(doc: &Doc, update: Update) -> Result<bool, AuthorityError> {
+    let mut txn = doc.transact_mut_with(REMOTE_ORIGIN);
+    txn.apply_update(update)
+        .map_err(|error| AuthorityError::InvalidUpdate(error.to_string()))?;
+    Ok(!txn.delete_set().is_empty())
 }
 
 /// Re-encodes `bytes` without each client's blocks from the first one past
@@ -8926,6 +8919,83 @@ mod tests {
             WorkbookAuthority::from_model_with_client_id(&model, base.bootstrap_client_id),
             Err(AuthorityError::ClientIdConflict(_))
         ));
+    }
+
+    #[test]
+    fn shadowed_deletes_wait_for_missing_items_and_commit_with_pending_blocks() {
+        let model = rich_model();
+        let source = WorkbookAuthority::from_model_with_client_id(&model, 25).unwrap();
+        let target = WorkbookAuthority::from_model_with_client_id(&model, 26).unwrap();
+        let sheet = {
+            let txn = source.doc.transact();
+            txn.get_map(SHEETS)
+                .unwrap()
+                .get(&txn, "sheet:0")
+                .and_then(|value| value.cast::<MapRef>().ok())
+                .unwrap()
+        };
+        let insertions = ["merge:B4:D5", "merge:B4:D6", "merge:B5:D6"].map(|key| {
+            let mut txn = source.doc.transact_mut();
+            sheet.insert(&mut txn, key, true);
+            txn.encode_update_v1()
+        });
+        let deletion = {
+            let mut txn = source.doc.transact_mut();
+            sheet.remove(&mut txn, "merge:B4:D5");
+            txn.encode_update_v1()
+        };
+        let before = target.encode_state_as_update_v1();
+        let staged = target.stage_updates_v1(&[&deletion], None).unwrap();
+        assert!(staged.pending);
+        assert!(!staged.effective);
+        assert_eq!(staged.commit_update, Update::EMPTY_V1);
+        assert_eq!(target.encode_state_as_update_v1(), before);
+
+        let staged = target.stage_updates_v1(&[&insertions[0]], None).unwrap();
+        target
+            .apply_staged_update_v1(&staged.commit_update)
+            .unwrap();
+        let vector = target.encode_state_vector_v1();
+        let structure = target.structure().unwrap();
+        let pending = Update::merge_updates([
+            Update::decode_v1(&insertions[2]).unwrap(),
+            Update::decode_v1(&deletion).unwrap(),
+        ])
+        .encode_v1();
+        let staged = target.stage_updates_v1(&[&pending], None).unwrap();
+        assert!(staged.pending);
+        assert!(staged.effective);
+        assert_eq!(staged.model, model);
+        assert_eq!(staged.structure, structure);
+        target
+            .apply_staged_update_v1(&staged.commit_update)
+            .unwrap();
+        assert_eq!(target.encode_state_vector_v1(), vector);
+        let staged = target.stage_updates_v1(&[&pending], None).unwrap();
+        assert!(staged.pending);
+        assert!(!staged.effective);
+        assert_eq!(staged.commit_update, Update::EMPTY_V1);
+
+        let staged = target.stage_updates_v1(&[&insertions[1]], None).unwrap();
+        target
+            .apply_staged_update_v1(&staged.commit_update)
+            .unwrap();
+        let staged = target.stage_updates_v1(&[&pending], None).unwrap();
+        assert!(!staged.pending);
+        assert!(staged.effective);
+        target
+            .apply_staged_update_v1(&staged.commit_update)
+            .unwrap();
+        assert_eq!(
+            target.encode_state_as_update_v1(),
+            source.encode_state_as_update_v1()
+        );
+        assert!(
+            !target
+                .stage_updates_v1(&[&deletion], None)
+                .unwrap()
+                .effective
+        );
     }
 
     #[test]
