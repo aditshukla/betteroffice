@@ -9073,7 +9073,7 @@ mod tests {
     fn hyperlink_snapshots_refuse_noncanonical_baselines_with_or_without_edits() {
         for edited in [false, true] {
             let link = test_hyperlink("A1", "Data!A1");
-            let canonical = serde_json::to_string(&[link.clone()]).unwrap();
+            let canonical = serde_json::to_string(std::slice::from_ref(&link)).unwrap();
             let mut extra = serde_json::to_value(&link).unwrap();
             extra
                 .as_object_mut()
