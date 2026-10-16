@@ -1282,7 +1282,9 @@ impl SnapshotValidation {
                                             .map_err(SnapshotError::new)?;
                                         } else if key.starts_with(HYPERLINK_PREFIX) {
                                             insert_hyperlink_edit(
-                                                self.hyperlink_edits.entry(sheet_index).or_default(),
+                                                self.hyperlink_edits
+                                                    .entry(sheet_index)
+                                                    .or_default(),
                                                 key,
                                                 &value,
                                             )

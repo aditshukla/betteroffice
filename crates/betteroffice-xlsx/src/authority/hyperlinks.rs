@@ -1,5 +1,5 @@
-use super::*;
 use super::merges::{MAX_MERGE_EDITS_PER_SHEET, MergeIndex};
+use super::*;
 
 pub(super) const HYPERLINK_PREFIX: &str = "hyperlink:";
 pub(super) type HyperlinkEdits = BTreeMap<String, Option<Hyperlink>>;
@@ -27,7 +27,9 @@ pub(super) fn insert_hyperlink_edit(
         || range.start.col >= MAX_COLS
         || range.end.col >= MAX_COLS
     {
-        return Err(format!("noncanonical or out of bounds hyperlink edit {key}"));
+        return Err(format!(
+            "noncanonical or out of bounds hyperlink edit {key}"
+        ));
     }
     let link = match value {
         Out::Any(Any::Bool(false)) => None,
@@ -148,10 +150,14 @@ impl HyperlinkProjection {
         if !self.changed {
             return Ok(Some(link));
         }
-        if self.baseline_occupied.overlaps(1, 0, MAX_COLS - 1, &link.range) {
+        if self
+            .baseline_occupied
+            .overlaps(1, 0, MAX_COLS - 1, &link.range)
+        {
             return Err("cannot edit overlapping imported hyperlinks".to_string());
         }
-        self.baseline_occupied.insert(1, 0, MAX_COLS - 1, &link.range);
+        self.baseline_occupied
+            .insert(1, 0, MAX_COLS - 1, &link.range);
         let link = self.edits.remove(&link.range.to_a1()).unwrap_or(Some(link));
         Ok(link.and_then(|link| self.choose(link)))
     }
@@ -179,7 +185,7 @@ pub(super) struct HyperlinkBaseline {
 
 impl HyperlinkBaseline {
     pub(super) fn next(&mut self, json: &str) -> Result<Option<Hyperlink>, String> {
-        use crate::sheet_json::{MAX_HYPERLINKS_PER_SHEET, MAX_HYPERLINK_STATE_BYTES};
+        use crate::sheet_json::{MAX_HYPERLINK_STATE_BYTES, MAX_HYPERLINKS_PER_SHEET};
 
         let invalid = || "sheet hyperlinks are invalid".to_string();
         if self.done {

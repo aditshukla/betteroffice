@@ -40,8 +40,8 @@ mod merges;
 pub(crate) mod snapshot;
 pub(crate) mod snapshot_validation;
 use hyperlinks::{
-    HYPERLINK_PREFIX, HyperlinkBaseline, HyperlinkEdits, HyperlinkProjection, clear_hyperlink_edits,
-    insert_hyperlink_edit, project_hyperlinks, sync_hyperlinks,
+    HYPERLINK_PREFIX, HyperlinkBaseline, HyperlinkEdits, HyperlinkProjection,
+    clear_hyperlink_edits, insert_hyperlink_edit, project_hyperlinks, sync_hyperlinks,
 };
 use merges::{
     MERGE_PREFIX, MergeEdits, MergeProjection, clear_merge_edits, clear_sheet_edits,
@@ -9244,7 +9244,11 @@ mod tests {
                 .unwrap()
                 .cast::<MapRef>()
                 .unwrap();
-            assert!(sheet.keys(&txn).all(|key| !key.starts_with(HYPERLINK_PREFIX)));
+            assert!(
+                sheet
+                    .keys(&txn)
+                    .all(|key| !key.starts_with(HYPERLINK_PREFIX))
+            );
             let Out::Any(Any::String(baseline)) = sheet.get(&txn, HYPERLINKS).unwrap() else {
                 panic!("missing baseline")
             };
@@ -9275,7 +9279,10 @@ mod tests {
         left.apply_update_v1(&right_update, options).unwrap();
         right.apply_update_v1(&left_update, options).unwrap();
         assert_eq!(left.model(), right.model());
-        assert_eq!(left.encode_state_vector_v1(), right.encode_state_vector_v1());
+        assert_eq!(
+            left.encode_state_vector_v1(),
+            right.encode_state_vector_v1()
+        );
         for workbook in [&left, &right] {
             let doc = Doc::new();
             hydrate_doc(&doc, &workbook.encode_state_as_update_v1()).unwrap();
@@ -9367,12 +9374,8 @@ mod tests {
                 vec![test_hyperlink("A1:B2", "Links!E1")]
             );
             if remove {
-                left.remove_hyperlink(
-                    SheetId(0),
-                    CellRange::parse_a1("A1:B2").unwrap(),
-                    options,
-                )
-                .unwrap();
+                left.remove_hyperlink(SheetId(0), CellRange::parse_a1("A1:B2").unwrap(), options)
+                    .unwrap();
             } else {
                 left.set_hyperlink(SheetId(0), test_hyperlink("B2:D4", "Links!E2"), options)
                     .unwrap();
