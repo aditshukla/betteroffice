@@ -777,38 +777,12 @@ impl SnapshotValidation {
                     }
                     self.sheet_keys.insert(self.sheet, key.clone());
                     self.sheet_indices.insert(key, self.sheet);
-                    let hidden_maps = [HIDDEN_COL_WIDTHS, HIDDEN_ROW_HEIGHTS].map(|field| {
-                        map.get(&txn, field)
-                            .map(|_| nested_map(&map, &txn, field).map(|child| (field, child)))
-                            .transpose()
-                    });
-                    let [widths, heights] = hidden_maps;
-                    let widths = widths.map_err(SnapshotError::new)?;
-                    let heights = heights.map_err(SnapshotError::new)?;
-                    augment(
-                        self.unit_bytes
-                            + 128
-                                * (usize::from(widths.is_some()) + usize::from(heights.is_some())),
-                        budget,
-                        &mut self.unit_bytes,
-                    )?;
-                    for (field, child) in widths.into_iter().chain(heights) {
-                        self.maps.insert(parent(&child), (self.sheet, field));
-                    }
                     self.maps.insert(parent(&map), (self.sheet, "sheet"));
                     self.field += 1;
                     return Ok(false);
                 }
                 if let Some(&field) = required.get(self.field - 1) {
-                    if matches!(
-                        field,
-                        CONTENTS
-                            | STYLES
-                            | COL_WIDTHS
-                            | ROW_HEIGHTS
-                            | HIDDEN_COL_WIDTHS
-                            | HIDDEN_ROW_HEIGHTS
-                    ) {
+                    if matches!(field, CONTENTS | STYLES | COL_WIDTHS | ROW_HEIGHTS) {
                         allowance(128, budget, &mut self.unit_bytes)?;
                         let child = nested_map(&map, &txn, field).map_err(SnapshotError::new)?;
                         self.maps.insert(parent(&child), (self.sheet, field));
@@ -1079,7 +1053,7 @@ impl SnapshotValidation {
                 }
                 if (required.len() + 4..=required.len() + 5).contains(&self.field) {
                     let columns = self.field == required.len() + 4;
-                    if let Some(hidden) = (self.version < HIDDEN_DIMENSIONS_SCHEMA_VERSION)
+                    if let Some(hidden) = (self.version < SCHEMA_VERSION)
                         .then(|| {
                             base.hidden_dimensions
                                 .get(base_sheet_index(&key).unwrap_or(usize::MAX))
@@ -1108,8 +1082,7 @@ impl SnapshotValidation {
                             } else {
                                 &sheet.row_heights
                             };
-                            if value == 0.0
-                                && child.get(&txn, &index.to_string()).is_none()
+                            if child.get(&txn, &index.to_string()).is_none()
                                 && dimensions.get(&index).copied().map(f64::to_bits)
                                     != Some(value.to_bits())
                             {
@@ -1348,41 +1321,16 @@ impl SnapshotValidation {
                                             }
                                         }
                                     }
-                                    COL_WIDTHS | ROW_HEIGHTS | HIDDEN_COL_WIDTHS
-                                    | HIDDEN_ROW_HEIGHTS => {
+                                    COL_WIDTHS | ROW_HEIGHTS => {
                                         let index = key.parse::<u32>().map_err(|_| invalid())?;
-                                        let dimensions = match field {
-                                            COL_WIDTHS => &sheet.col_widths,
-                                            ROW_HEIGHTS => &sheet.row_heights,
-                                            HIDDEN_COL_WIDTHS => &sheet.hidden_col_widths,
-                                            _ => &sheet.hidden_row_heights,
-                                        };
-                                        let number = value.cast::<f64>().map_err(|_| invalid())?;
-                                        let limit =
-                                            if matches!(field, COL_WIDTHS | HIDDEN_COL_WIDTHS) {
-                                                MAX_COLS
-                                            } else {
-                                                MAX_ROWS
-                                            };
-                                        if index >= limit || !number.is_finite() {
-                                            return Err(invalid());
-                                        }
-                                        let visible = match field {
-                                            HIDDEN_COL_WIDTHS => {
-                                                sheet.col_widths.get(&index) != Some(&0.0)
-                                            }
-                                            HIDDEN_ROW_HEIGHTS => {
-                                                sheet.row_heights.get(&index) != Some(&0.0)
-                                            }
-                                            _ => false,
+                                        let dimensions = if field == COL_WIDTHS {
+                                            &sheet.col_widths
+                                        } else {
+                                            &sheet.row_heights
                                         };
                                         if key.as_ref() != index.to_string()
-                                            || (!visible
-                                                && Some(number.to_bits())
-                                                    != dimensions
-                                                        .get(&index)
-                                                        .copied()
-                                                        .map(f64::to_bits))
+                                            || value.cast::<f64>().ok().map(f64::to_bits)
+                                                != dimensions.get(&index).copied().map(f64::to_bits)
                                         {
                                             return Err(invalid());
                                         }
@@ -1458,18 +1406,11 @@ impl SnapshotValidation {
                     }
                     return Ok(false);
                 }
-                if self.field == 2 && sheet.hidden_col_widths.is_empty() {
-                    self.field += 1;
-                }
-                if self.field == 3 && sheet.hidden_row_heights.is_empty() {
-                    self.field += 1;
-                }
-                if self.field < 4 {
-                    let dimensions = match self.field {
-                        0 => &sheet.col_widths,
-                        1 => &sheet.row_heights,
-                        2 => &sheet.hidden_col_widths,
-                        _ => &sheet.hidden_row_heights,
+                if self.field < 2 {
+                    let dimensions = if self.field == 0 {
+                        &sheet.col_widths
+                    } else {
+                        &sheet.row_heights
                     };
                     let next = match self.dimension {
                         Some(after) => dimensions.range((Excluded(after), Unbounded)).next(),
@@ -1477,25 +1418,16 @@ impl SnapshotValidation {
                     };
                     if let Some((&index, &value)) = next {
                         allowance(128, budget, &mut self.unit_bytes)?;
-                        let field = match self.field {
-                            0 => COL_WIDTHS,
-                            1 => ROW_HEIGHTS,
-                            2 => HIDDEN_COL_WIDTHS,
-                            _ => HIDDEN_ROW_HEIGHTS,
+                        let field = if self.field == 0 {
+                            COL_WIDTHS
+                        } else {
+                            ROW_HEIGHTS
                         };
-                        let child = map
-                            .get(&txn, field)
-                            .map(|_| nested_map(&map, &txn, field))
-                            .transpose()
-                            .map_err(SnapshotError::new)?;
+                        let child = nested_map(&map, &txn, field).map_err(SnapshotError::new)?;
                         let actual = child
-                            .as_ref()
-                            .and_then(|child| child.get(&txn, &index.to_string()))
+                            .get(&txn, &index.to_string())
                             .and_then(|value| value.cast::<f64>().ok());
-                        let fallback = if (self.field < 2
-                            && self.version < HIDDEN_DIMENSIONS_SCHEMA_VERSION)
-                            || (self.field >= 2 && child.is_none())
-                        {
+                        let fallback = if self.version < SCHEMA_VERSION {
                             base.hidden_dimensions
                                 .get(
                                     base_sheet_index(
@@ -1507,14 +1439,13 @@ impl SnapshotValidation {
                                     .unwrap_or(usize::MAX),
                                 )
                                 .and_then(|hidden| {
-                                    if matches!(self.field, 0 | 2) {
+                                    if self.field == 0 {
                                         hidden.col_widths.get(&index)
                                     } else {
                                         hidden.row_heights.get(&index)
                                     }
                                 })
                                 .copied()
-                                .filter(|size| (self.field >= 2) == (*size > 0.0))
                         } else {
                             None
                         };

@@ -49,14 +49,12 @@ const MIN_SUPPORTED_SCHEMA_VERSION: i64 = 3;
 const FREEZE_PANE_SCHEMA_VERSION: i64 = 4;
 const HYPERLINK_SCHEMA_VERSION: i64 = 5;
 const CHARTS_SCHEMA_VERSION: i64 = 6;
-const HIDDEN_DIMENSIONS_SCHEMA_VERSION: i64 = 6;
 const SCHEMA_VERSION: i64 = 6;
 const BASE_FINGERPRINT: &str = "baseFingerprint";
 const STRUCTURE_GENERATION: &str = "structureGeneration";
 const CHARTS: &str = "charts";
 const CONTENTS: &str = "contents";
 const COL_WIDTHS: &str = "colWidths";
-const HIDDEN_COL_WIDTHS: &str = "hiddenColWidths";
 const COL_STYLES: &str = "colStyles";
 const ROW_STYLES: &str = "rowStyles";
 const FREEZE_PANE: &str = "freezePane";
@@ -64,7 +62,6 @@ const HYPERLINKS: &str = "hyperlinks";
 const MERGES: &str = "merges";
 const NAME: &str = "name";
 const ROW_HEIGHTS: &str = "rowHeights";
-const HIDDEN_ROW_HEIGHTS: &str = "hiddenRowHeights";
 const STYLES: &str = "styles";
 const BOOTSTRAP_ORIGIN: &str = "xlsx:bootstrap";
 const HYDRATE_ORIGIN: &str = "xlsx:hydrate";
@@ -191,41 +188,34 @@ impl WorkbookBase {
     ) -> Result<Self, String> {
         let mut builder = FingerprintBuilder::new(model, legacy_dimensions);
         let styles = FingerprintStyles::new(&model.styles);
-        let ((mut fingerprint, mut bootstrap_client_id), mut fingerprints) =
-            builder.batched(|builder| {
-                let current_styles = if released_styles(&model.styles) {
-                    styles
-                } else {
-                    styles.with_written_fills()
-                };
-                let current = builder.current(current_styles)?;
-                let mut fingerprints =
-                    builder.accepted_fingerprints(styles.without_xf_facets(), legacy_styles)?;
-                let released = fingerprints.remove(&SCHEMA_VERSION).unwrap_or_default();
-                let mut accepted = builder.current_fingerprints(current_styles, legacy_styles)?;
-                if current_styles.as_written {
-                    for reading in [styles, current_styles.without_xf_facets()] {
-                        for fingerprint in builder.current_fingerprints(reading, legacy_styles)? {
-                            if !accepted.contains(&fingerprint) {
-                                accepted.push(fingerprint);
-                            }
+        let ((fingerprint, bootstrap_client_id), fingerprints) = builder.batched(|builder| {
+            let current_styles = if released_styles(&model.styles) {
+                styles
+            } else {
+                styles.with_written_fills()
+            };
+            let current = builder.current(current_styles)?;
+            let mut fingerprints =
+                builder.accepted_fingerprints(styles.without_xf_facets(), legacy_styles)?;
+            let released = fingerprints.remove(&SCHEMA_VERSION).unwrap_or_default();
+            let mut accepted = builder.current_fingerprints(current_styles, legacy_styles)?;
+            if current_styles.as_written {
+                for reading in [styles, current_styles.without_xf_facets()] {
+                    for fingerprint in builder.current_fingerprints(reading, legacy_styles)? {
+                        if !accepted.contains(&fingerprint) {
+                            accepted.push(fingerprint);
                         }
                     }
                 }
-                for fingerprint in released {
-                    if !accepted.contains(&fingerprint) {
-                        accepted.push(fingerprint);
-                    }
+            }
+            for fingerprint in released {
+                if !accepted.contains(&fingerprint) {
+                    accepted.push(fingerprint);
                 }
-                fingerprints.insert(SCHEMA_VERSION, accepted);
-                Ok((current, fingerprints))
-            })?;
-        retain_hidden_size_fingerprints(
-            model,
-            &mut fingerprint,
-            &mut bootstrap_client_id,
-            &mut fingerprints,
-        );
+            }
+            fingerprints.insert(SCHEMA_VERSION, accepted);
+            Ok((current, fingerprints))
+        })?;
         Ok(Self {
             bootstrap_client_id,
             date_system: model.date_system,
@@ -292,12 +282,6 @@ impl WorkbookBase {
         base.fingerprints.insert(SCHEMA_VERSION, accepted);
         base.fingerprint = fingerprint;
         base.bootstrap_client_id = bootstrap_client_id;
-        retain_hidden_size_fingerprints(
-            model,
-            &mut base.fingerprint,
-            &mut base.bootstrap_client_id,
-            &mut base.fingerprints,
-        );
         base.styles = model.styles.clone();
         Ok(base)
     }
@@ -1831,8 +1815,6 @@ impl WorkbookAuthority {
                         charts,
                         sheet.col_widths.clone(),
                         sheet.row_heights.clone(),
-                        sheet.hidden_col_widths.clone(),
-                        sheet.hidden_row_heights.clone(),
                     ),
                 ))
             })
@@ -1855,15 +1837,11 @@ impl WorkbookAuthority {
                 .get(&txn, &key)
                 .and_then(|value| value.cast::<MapRef>().ok())
                 .ok_or_else(|| format!("sheet {key} is not a map"))?;
-            if let Some((_, _, _, col_widths, row_heights, hidden_col_widths, hidden_row_heights)) =
-                features.get(&key)
-            {
+            if let Some((.., col_widths, row_heights)) = features.get(&key) {
                 let widths: MapRef = sheet.get_or_init(&mut txn, COL_WIDTHS);
                 sync_numbers(&widths, &mut txn, col_widths);
                 let heights: MapRef = sheet.get_or_init(&mut txn, ROW_HEIGHTS);
                 sync_numbers(&heights, &mut txn, row_heights);
-                sync_optional_numbers(&sheet, &mut txn, HIDDEN_COL_WIDTHS, hidden_col_widths);
-                sync_optional_numbers(&sheet, &mut txn, HIDDEN_ROW_HEIGHTS, hidden_row_heights);
             }
             let (freeze_pane, hyperlinks, charts) = features
                 .get(&key)
@@ -2270,13 +2248,6 @@ impl WorkbookAuthority {
                     col,
                     sheet_model.col_widths.get(&col).copied(),
                 );
-                let hidden_map: MapRef = sheet_map.get_or_init(&mut txn, HIDDEN_COL_WIDTHS);
-                sync_number(
-                    &hidden_map,
-                    &mut txn,
-                    col,
-                    sheet_model.hidden_col_widths.get(&col).copied(),
-                );
             }
             for (key, row) in row_heights {
                 let (sheet_map, sheet_model) =
@@ -2287,13 +2258,6 @@ impl WorkbookAuthority {
                     &mut txn,
                     row,
                     sheet_model.row_heights.get(&row).copied(),
-                );
-                let hidden_map: MapRef = sheet_map.get_or_init(&mut txn, HIDDEN_ROW_HEIGHTS);
-                sync_number(
-                    &hidden_map,
-                    &mut txn,
-                    row,
-                    sheet_model.hidden_row_heights.get(&row).copied(),
                 );
             }
             for key in merges {
@@ -3550,15 +3514,8 @@ fn sync_sheet_with_style_key(
     let row_heights: MapRef = sheet_map.get_or_init(txn, ROW_HEIGHTS);
     let styles: MapRef = sheet_map.get_or_init(txn, STYLES);
     sync_numbers(&col_widths, txn, &sheet.col_widths);
-    sync_optional_numbers(sheet_map, txn, HIDDEN_COL_WIDTHS, &sheet.hidden_col_widths);
     sync_contents(&contents, txn, sheet);
     sync_numbers(&row_heights, txn, &sheet.row_heights);
-    sync_optional_numbers(
-        sheet_map,
-        txn,
-        HIDDEN_ROW_HEIGHTS,
-        &sheet.hidden_row_heights,
-    );
     sync_styles(&styles, txn, sheet, style_key)?;
     Ok(())
 }
@@ -4003,18 +3960,6 @@ fn sync_optional(map: &MapRef, txn: &mut TransactionMut<'_>, key: &str, value: O
     }
 }
 
-fn sync_optional_numbers(
-    sheet: &MapRef,
-    txn: &mut TransactionMut<'_>,
-    field: &str,
-    values: &BTreeMap<u32, f64>,
-) {
-    if !values.is_empty() || sheet.get(txn, field).is_some() {
-        let map: MapRef = sheet.get_or_init(txn, field);
-        sync_numbers(&map, txn, values);
-    }
-}
-
 fn sync_numbers(map: &MapRef, txn: &mut TransactionMut<'_>, values: &BTreeMap<u32, f64>) {
     let retained = values.keys().map(u32::to_string).collect::<HashSet<_>>();
     let mut stale = map
@@ -4120,34 +4065,14 @@ fn materialize_sheet<T: ReadTxn>(
         MAX_ROWS,
         "row height",
     )?;
-    if version < HIDDEN_DIMENSIONS_SCHEMA_VERSION {
+    if version < SCHEMA_VERSION {
         for (&at, &size) in &fallbacks.hidden_dimensions.col_widths {
-            if size == 0.0 {
-                sheet.col_widths.entry(at).or_insert(0.0);
-            }
+            sheet.col_widths.entry(at).or_insert(size);
         }
         for (&at, &size) in &fallbacks.hidden_dimensions.row_heights {
-            if size == 0.0 {
-                sheet.row_heights.entry(at).or_insert(0.0);
-            }
+            sheet.row_heights.entry(at).or_insert(size);
         }
     }
-    sheet.hidden_col_widths = materialize_hidden_sizes(
-        sheet_map,
-        txn,
-        HIDDEN_COL_WIDTHS,
-        MAX_COLS,
-        &sheet.col_widths,
-        &fallbacks.hidden_dimensions.col_widths,
-    )?;
-    sheet.hidden_row_heights = materialize_hidden_sizes(
-        sheet_map,
-        txn,
-        HIDDEN_ROW_HEIGHTS,
-        MAX_ROWS,
-        &sheet.row_heights,
-        &fallbacks.hidden_dimensions.row_heights,
-    )?;
     sheet.format = fallbacks.format;
     sheet.col_styles = fallbacks.col_styles.to_vec();
     sheet.row_styles = fallbacks.row_styles.clone();
@@ -4228,28 +4153,6 @@ fn sheet_shared_types<T: ReadTxn>(sheet_map: &MapRef, txn: &T) -> Result<SheetSh
         row_heights: nested_map(sheet_map, txn, ROW_HEIGHTS)?.as_ref().id(),
         styles: nested_map(sheet_map, txn, STYLES)?.as_ref().id(),
     })
-}
-
-fn materialize_hidden_sizes<T: ReadTxn>(
-    sheet: &MapRef,
-    txn: &T,
-    field: &str,
-    limit: u32,
-    visible: &BTreeMap<u32, f64>,
-    fallback: &BTreeMap<u32, f64>,
-) -> Result<BTreeMap<u32, f64>, String> {
-    let values = match sheet.get(txn, field) {
-        Some(_) => materialize_numbers(&nested_map(sheet, txn, field)?, txn, limit, field)?,
-        None => fallback
-            .iter()
-            .filter(|(_, size)| **size > 0.0)
-            .map(|(&index, &size)| (index, size))
-            .collect(),
-    };
-    Ok(values
-        .into_iter()
-        .filter(|(index, _)| visible.get(index) == Some(&0.0))
-        .collect())
 }
 
 fn materialize_numbers<T: ReadTxn>(
@@ -4356,14 +4259,8 @@ fn sheet_schema_keys(version: i64) -> &'static [&'static str] {
 /// deletes the key outright, so it reads as absent and falls back to what the
 /// source package holds rather than failing the whole workbook.
 fn sheet_schema_optional_keys(version: i64) -> &'static [&'static str] {
-    const NONE: &[&str] = &[HIDDEN_COL_WIDTHS, HIDDEN_ROW_HEIGHTS];
-    const V6: &[&str] = &[
-        CHARTS,
-        ROW_STYLES,
-        COL_STYLES,
-        HIDDEN_COL_WIDTHS,
-        HIDDEN_ROW_HEIGHTS,
-    ];
+    const NONE: &[&str] = &[];
+    const V6: &[&str] = &[CHARTS, ROW_STYLES, COL_STYLES];
     if version >= CHARTS_SCHEMA_VERSION {
         V6
     } else {
@@ -4688,7 +4585,9 @@ fn any_bool(value: &Any, label: &str) -> Result<bool, String> {
     }
 }
 
-/// Hidden dimensions: zero without an authored size, otherwise the retained size.
+/// Dimensions only this build's parser records: a hidden row or column with no
+/// authored size. A state written before it did carries no entry at all, so
+/// materializing one has to put them back or the row silently unhides.
 #[derive(Clone, Debug, Default)]
 struct HiddenDimensions {
     col_widths: BTreeMap<u32, f64>,
@@ -4780,39 +4679,19 @@ fn hidden_dimensions(
         .iter()
         .enumerate()
         .map(|(index, sheet)| {
-            let legacy = legacy_dimensions.get(index);
-            let retained = |current: &BTreeMap<u32, f64>,
-                            before: Option<&BTreeMap<u32, f64>>,
-                            authored: &BTreeMap<u32, f64>| {
+            let Some(legacy) = legacy_dimensions.get(index) else {
+                return HiddenDimensions::default();
+            };
+            let only_current = |current: &BTreeMap<u32, f64>, before: &BTreeMap<u32, f64>| {
                 current
                     .iter()
-                    .filter_map(|(&at, &size)| {
-                        if size != 0.0 {
-                            return None;
-                        }
-                        authored
-                            .get(&at)
-                            .copied()
-                            .or_else(|| {
-                                before
-                                    .is_some_and(|before| !before.contains_key(&at))
-                                    .then_some(0.0)
-                            })
-                            .map(|size| (at, size))
-                    })
+                    .filter(|(at, _)| !before.contains_key(at))
+                    .map(|(at, size)| (*at, *size))
                     .collect()
             };
             HiddenDimensions {
-                col_widths: retained(
-                    &sheet.col_widths,
-                    legacy.map(|legacy| &legacy.col_widths),
-                    &sheet.hidden_col_widths,
-                ),
-                row_heights: retained(
-                    &sheet.row_heights,
-                    legacy.map(|legacy| &legacy.row_heights),
-                    &sheet.hidden_row_heights,
-                ),
+                col_widths: only_current(&sheet.col_widths, &legacy.col_widths),
+                row_heights: only_current(&sheet.row_heights, &legacy.row_heights),
             }
         })
         .collect()
@@ -5555,8 +5434,7 @@ fn fingerprint_domain(schema_version: i64, reading: FingerprintReading) -> &'sta
             3 => b"betteroffice-xlsx-yrs-v3",
             4 => b"betteroffice-xlsx-yrs-v4",
             5 => b"betteroffice-xlsx-yrs-v5",
-            6 => b"betteroffice-xlsx-yrs-v6",
-            _ => b"betteroffice-xlsx-yrs-v7",
+            _ => b"betteroffice-xlsx-yrs-v6",
         },
     }
 }
@@ -5736,54 +5614,6 @@ fn fingerprint_model(
             (fingerprint, client)
         })
         .collect())
-}
-
-fn retain_hidden_size_fingerprints(
-    model: &WorkbookModel,
-    fingerprint: &mut String,
-    bootstrap_client_id: &mut u64,
-    fingerprints: &mut BTreeMap<i64, Vec<String>>,
-) {
-    if model
-        .sheets
-        .iter()
-        .all(|sheet| sheet.hidden_col_widths.is_empty() && sheet.hidden_row_heights.is_empty())
-    {
-        return;
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(b"betteroffice-xlsx-hidden-sizes");
-    hash_u64(&mut hasher, model.sheets.len() as u64);
-    for sheet in &model.sheets {
-        for sizes in [&sheet.hidden_col_widths, &sheet.hidden_row_heights] {
-            hash_u64(&mut hasher, sizes.len() as u64);
-            for (&index, &size) in sizes {
-                hash_u32(&mut hasher, index);
-                hash_u64(&mut hasher, size.to_bits());
-            }
-        }
-    }
-    let sizes = hasher.finalize();
-    let retained = |fingerprint: &str| {
-        let mut hasher = Sha256::new();
-        hasher.update(sizes);
-        hash_bytes(&mut hasher, fingerprint.as_bytes());
-        fingerprint_text(
-            fingerprint_reading(fingerprint),
-            format!("{:x}", hasher.finalize()),
-        )
-    };
-    if let Some(accepted) = fingerprints.get_mut(&SCHEMA_VERSION) {
-        accepted.extend(
-            accepted
-                .clone()
-                .iter()
-                .map(|fingerprint| retained(fingerprint)),
-        );
-    }
-    *fingerprint = retained(fingerprint);
-    *bootstrap_client_id =
-        fingerprint_client_id(fingerprint).expect("retained-size fingerprint is a tagged digest");
 }
 
 fn client_id_of_digest(head: u64) -> u64 {
@@ -6156,34 +5986,14 @@ fn materialize_sheet_oracle<T: ReadTxn>(
         MAX_ROWS,
         "row height",
     )?;
-    if version < HIDDEN_DIMENSIONS_SCHEMA_VERSION {
+    if version < SCHEMA_VERSION {
         for (&at, &size) in &fallbacks.hidden_dimensions.col_widths {
-            if size == 0.0 {
-                sheet.col_widths.entry(at).or_insert(0.0);
-            }
+            sheet.col_widths.entry(at).or_insert(size);
         }
         for (&at, &size) in &fallbacks.hidden_dimensions.row_heights {
-            if size == 0.0 {
-                sheet.row_heights.entry(at).or_insert(0.0);
-            }
+            sheet.row_heights.entry(at).or_insert(size);
         }
     }
-    sheet.hidden_col_widths = materialize_hidden_sizes(
-        sheet_map,
-        txn,
-        HIDDEN_COL_WIDTHS,
-        MAX_COLS,
-        &sheet.col_widths,
-        &fallbacks.hidden_dimensions.col_widths,
-    )?;
-    sheet.hidden_row_heights = materialize_hidden_sizes(
-        sheet_map,
-        txn,
-        HIDDEN_ROW_HEIGHTS,
-        MAX_ROWS,
-        &sheet.row_heights,
-        &fallbacks.hidden_dimensions.row_heights,
-    )?;
     sheet.format = fallbacks.format;
     sheet.col_styles = fallbacks.col_styles.to_vec();
     sheet.row_styles = fallbacks.row_styles.clone();
@@ -6257,8 +6067,7 @@ fn fingerprint_model_with_row_styles_oracle(
         3 => b"betteroffice-xlsx-yrs-v3".as_slice(),
         4 => b"betteroffice-xlsx-yrs-v4".as_slice(),
         5 => b"betteroffice-xlsx-yrs-v5".as_slice(),
-        6 => b"betteroffice-xlsx-yrs-v6".as_slice(),
-        _ => b"betteroffice-xlsx-yrs-v7".as_slice(),
+        _ => b"betteroffice-xlsx-yrs-v6".as_slice(),
     };
     fingerprint_model_with_row_domain_oracle(
         model,
@@ -7356,8 +7165,6 @@ mod tests {
                 if version < FREEZE_PANE_SCHEMA_VERSION {
                     sheet.remove(&mut txn, FREEZE_PANE);
                 }
-                sheet.remove(&mut txn, HIDDEN_COL_WIDTHS);
-                sheet.remove(&mut txn, HIDDEN_ROW_HEIGHTS);
             }
         }
         doc.transact()
@@ -7800,71 +7607,10 @@ mod tests {
     }
 
     #[test]
-    fn schema_six_current_style_readings_remain_accepted_with_hidden_sizes() {
-        let mut model = rich_model();
-        model.sheets[0].col_widths.insert(1, 0.0);
-        model.sheets[0].hidden_col_widths.insert(1, 20.0);
-        model.sheets[0].row_heights.insert(2, 0.0);
-        model.sheets[0].hidden_row_heights.insert(2, 30.0);
-        let base = WorkbookBase::from_model(&model).unwrap();
-        let reading = FingerprintReading::Facets.with_defaults(has_style_defaults(&model));
-        let (fingerprint, _) = fingerprint_model_with_row_domain_oracle(
-            &model,
-            6,
-            true,
-            true,
-            true,
-            fingerprint_domain(6, reading),
-        )
-        .unwrap();
-        assert!(base.accepts_fingerprint(6, &fingerprint));
-    }
-
-    #[test]
-    fn optional_hidden_sizes_keep_schema_six_identity_and_restore_source_sizes() {
-        let mut model = rich_model();
-        model.sheets[0].col_widths.insert(1, 0.0);
-        model.sheets[0].hidden_col_widths.insert(1, 20.0);
-        model.sheets[0].row_heights.insert(2, 0.0);
-        model.sheets[0].hidden_row_heights.insert(2, 30.0);
-        let authority = WorkbookAuthority::from_model_with_client_id(&model, 11).unwrap();
-        let mut changed = model.clone();
-        changed.sheets[0].hidden_col_widths.insert(1, 25.0);
-        let changed = WorkbookAuthority::from_model_with_client_id(&changed, 12).unwrap();
-        assert_ne!(authority.base.fingerprint, changed.base.fingerprint);
-        assert_ne!(
-            authority.base.bootstrap_client_id,
-            changed.base.bootstrap_client_id
-        );
-        let update = legacy_update(&model, 6, true);
-        let restored = authority_from_update(&model, &update, 13);
-        assert_eq!(restored.schema_version().unwrap(), 6);
-        assert_eq!(restored.strict_materialize().unwrap().0, model);
-        let txn = restored.doc.transact();
-        let sheets = txn.get_map(SHEETS).unwrap();
-        let sheet = sheets
-            .get(&txn, "sheet:0")
-            .unwrap()
-            .cast::<MapRef>()
-            .unwrap();
-        assert!(sheet.get(&txn, HIDDEN_COL_WIDTHS).is_none());
-        assert!(sheet.get(&txn, HIDDEN_ROW_HEIGHTS).is_none());
-        drop(txn);
-        {
-            let mut txn = restored.doc.transact_mut();
-            let _: MapRef = sheet.get_or_init(&mut txn, HIDDEN_COL_WIDTHS);
-            let _: MapRef = sheet.get_or_init(&mut txn, HIDDEN_ROW_HEIGHTS);
-        }
-        model.sheets[0].hidden_col_widths.clear();
-        model.sheets[0].hidden_row_heights.clear();
-        assert_eq!(restored.strict_materialize().unwrap().0, model);
-    }
-
-    #[test]
     fn known_schema_versions_materialize_and_upgrade_to_current() {
         let model = rich_model();
         for (index, (version, include_defined_names)) in
-            [(3, false), (3, true), (4, true), (5, true), (6, true)]
+            [(3, false), (3, true), (4, true), (5, true)]
                 .into_iter()
                 .enumerate()
         {
@@ -7887,9 +7633,7 @@ mod tests {
     #[test]
     fn legacy_snapshot_merges_into_current_bootstrap() {
         let model = rich_model();
-        for (version, include_defined_names) in
-            [(3, false), (3, true), (4, true), (5, true), (6, true)]
-        {
+        for (version, include_defined_names) in [(3, false), (3, true), (4, true), (5, true)] {
             let update = legacy_update(&model, version, include_defined_names);
             let authority = WorkbookAuthority::from_model_with_client_id(&model, 108).unwrap();
             let staged = authority.stage_updates_v1(&[&update], None).unwrap();

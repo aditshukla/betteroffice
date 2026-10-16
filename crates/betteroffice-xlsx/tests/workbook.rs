@@ -7993,123 +7993,6 @@ fn collapsing_columns_under_a_chart_does_not_block_a_peer_moving_it() {
     }
 }
 
-#[test]
-fn native_visibility_preserves_custom_sizes_through_peers_undo_and_xlsx_save() {
-    let mut sheet = Sheet::new("Sized");
-    sheet.col_widths.insert(0, 24.0);
-    sheet.row_heights.insert(0, 30.0);
-    let model = WorkbookModel {
-        sheets: vec![sheet],
-        ..Default::default()
-    };
-    let source = ooxml_opc::rezip_parts(&xlsx_parse::serialize_workbook(&model).unwrap()).unwrap();
-    let mut author = Workbook::open_collaborative(&source, 880).unwrap();
-    let mut peer = Workbook::open_collaborative(&source, 881).unwrap();
-    author
-        .apply_ops(
-            vec![
-                Op::SetColVisibility {
-                    sheet: SheetId(0),
-                    col: 0,
-                    hidden: true,
-                },
-                Op::SetRowVisibility {
-                    sheet: SheetId(0),
-                    row: 0,
-                    hidden: true,
-                },
-            ],
-            CalculationOptions::default(),
-        )
-        .unwrap();
-    let update = author
-        .encode_diff_v1(&peer.encode_state_vector_v1())
-        .unwrap();
-    peer.apply_update_v1(&update, CalculationOptions::default())
-        .unwrap();
-    assert_eq!(author.model(), peer.model());
-    let hidden = &author.model().sheets[0];
-    assert_eq!(hidden.col_widths.get(&0), Some(&0.0));
-    assert_eq!(hidden.row_heights.get(&0), Some(&0.0));
-    assert_eq!(hidden.hidden_col_widths.get(&0), Some(&24.0));
-    assert_eq!(hidden.hidden_row_heights.get(&0), Some(&30.0));
-    let saved = author.save().unwrap();
-    let xml = String::from_utf8(package_map(&saved)["xl/worksheets/sheet1.xml"].clone()).unwrap();
-    assert!(
-        xml.contains(r#"width="24" customWidth="1" hidden="1""#),
-        "{xml}"
-    );
-    assert!(
-        xml.contains(r#"ht="30" customHeight="1" hidden="1""#),
-        "{xml}"
-    );
-    let reopened = Workbook::open(&saved).unwrap();
-    assert_eq!(
-        reopened.model().sheets[0].hidden_col_widths.get(&0),
-        Some(&24.0)
-    );
-    assert_eq!(
-        reopened.model().sheets[0].hidden_row_heights.get(&0),
-        Some(&30.0)
-    );
-    author.undo(CalculationOptions::default()).unwrap();
-    assert_eq!(author.model().sheets[0].col_widths.get(&0), Some(&24.0));
-    assert_eq!(author.model().sheets[0].row_heights.get(&0), Some(&30.0));
-    assert!(author.model().sheets[0].hidden_col_widths.is_empty());
-    assert!(author.model().sheets[0].hidden_row_heights.is_empty());
-}
-
-#[test]
-fn concurrent_visibility_and_resize_converge_to_a_valid_dimension() {
-    let mut sheet = Sheet::new("Sized");
-    sheet.col_widths.insert(0, 20.0);
-    let model = WorkbookModel {
-        sheets: vec![sheet],
-        ..Default::default()
-    };
-    let source = ooxml_opc::rezip_parts(&xlsx_parse::serialize_workbook(&model).unwrap()).unwrap();
-    let mut hider = Workbook::open_collaborative(&source, 882).unwrap();
-    let mut resizer = Workbook::open_collaborative(&source, 883).unwrap();
-    hider
-        .apply_ops(
-            vec![Op::SetColVisibility {
-                sheet: SheetId(0),
-                col: 0,
-                hidden: true,
-            }],
-            CalculationOptions::default(),
-        )
-        .unwrap();
-    resizer
-        .apply_ops(
-            vec![Op::SetColWidth {
-                sheet: SheetId(0),
-                col: 0,
-                width: Some(30.0),
-            }],
-            CalculationOptions::default(),
-        )
-        .unwrap();
-    let to_hider = resizer
-        .encode_diff_v1(&hider.encode_state_vector_v1())
-        .unwrap();
-    let to_resizer = hider
-        .encode_diff_v1(&resizer.encode_state_vector_v1())
-        .unwrap();
-    hider
-        .apply_update_v1(&to_hider, CalculationOptions::default())
-        .unwrap();
-    resizer
-        .apply_update_v1(&to_resizer, CalculationOptions::default())
-        .unwrap();
-    assert_eq!(hider.model(), resizer.model());
-    let column = &hider.model().sheets[0];
-    assert!(column.col_widths.get(&0) == Some(&0.0) || column.col_widths.get(&0) == Some(&30.0));
-    assert!(column.hidden_col_widths.is_empty() || column.col_widths.get(&0) == Some(&0.0));
-    assert!(hider.save().is_ok());
-    assert!(resizer.save().is_ok());
-}
-
 /// A local batch that repins only one of two sheets sharing an anchor is
 /// refused: it is this replica's own edit and it can simply be told no. The
 /// same disagreement arriving as an update cannot be refused — a peer may hold
@@ -9149,47 +9032,81 @@ fn zero_size_ops_preserve_authored_dimensions_in_saved_xml() {
         ..Default::default()
     };
     let source = ooxml_opc::rezip_parts(&xlsx_parse::serialize_workbook(&model).unwrap()).unwrap();
-    for collaborative in [false, true] {
-        let mut workbook = if collaborative {
-            Workbook::open_collaborative(&source, 867).unwrap()
-        } else {
-            Workbook::open(&source).unwrap()
-        };
-        workbook
-            .apply_ops(
-                vec![
-                    Op::SetColWidth {
-                        sheet: SheetId(0),
-                        col: 0,
-                        width: Some(0.0),
-                    },
-                    Op::SetRowHeight {
-                        sheet: SheetId(0),
-                        row: 0,
-                        height: Some(0.0),
-                    },
-                ],
-                CalculationOptions::default(),
-            )
-            .unwrap();
-        workbook
-            .edit_cell(
-                SheetId(0),
-                cell("B2"),
-                "edited",
-                CalculationOptions::default(),
-            )
-            .unwrap();
-        let saved = workbook.save().unwrap();
-        let parts = package_map(&saved);
-        let xml = std::str::from_utf8(&parts["xl/worksheets/sheet1.xml"]).unwrap();
-        assert!(xml.contains(r#"width="20""#), "{xml}");
-        assert!(xml.contains(r#"ht="30""#), "{xml}");
-        assert_eq!(xml.matches(r#"hidden="1""#).count(), 2, "{xml}");
-        let reopened = Workbook::open(&saved).unwrap();
-        assert_eq!(reopened.model().sheets[0].col_widths.get(&0), Some(&0.0));
-        assert_eq!(reopened.model().sheets[0].row_heights.get(&0), Some(&0.0));
-    }
+    let mut workbook = Workbook::open(&source).unwrap();
+    workbook
+        .apply_ops(
+            vec![
+                Op::SetColWidth {
+                    sheet: SheetId(0),
+                    col: 0,
+                    width: Some(0.0),
+                },
+                Op::SetRowHeight {
+                    sheet: SheetId(0),
+                    row: 0,
+                    height: Some(0.0),
+                },
+            ],
+            CalculationOptions::default(),
+        )
+        .unwrap();
+    workbook
+        .edit_cell(
+            SheetId(0),
+            cell("B2"),
+            "edited",
+            CalculationOptions::default(),
+        )
+        .unwrap();
+    let saved = workbook.save().unwrap();
+    let parts = package_map(&saved);
+    let xml = std::str::from_utf8(&parts["xl/worksheets/sheet1.xml"]).unwrap();
+    assert!(xml.contains(r#"width="20""#), "{xml}");
+    assert!(xml.contains(r#"ht="30""#), "{xml}");
+    assert_eq!(xml.matches(r#"hidden="1""#).count(), 2, "{xml}");
+    let mut reopened = Workbook::open(&saved).unwrap();
+    assert_eq!(reopened.model().sheets[0].col_widths.get(&0), Some(&0.0));
+    assert_eq!(reopened.model().sheets[0].row_heights.get(&0), Some(&0.0));
+
+    assert_eq!(
+        reopened.model().sheets[0].hidden_col_widths.get(&0),
+        Some(&20.0)
+    );
+    assert_eq!(
+        reopened.model().sheets[0].hidden_row_heights.get(&0),
+        Some(&30.0)
+    );
+    reopened
+        .apply_ops(
+            vec![
+                Op::SetColVisibility {
+                    sheet: SheetId(0),
+                    col: 0,
+                    hidden: false,
+                },
+                Op::SetRowVisibility {
+                    sheet: SheetId(0),
+                    row: 0,
+                    hidden: false,
+                },
+            ],
+            CalculationOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(reopened.model().sheets[0].col_widths.get(&0), Some(&20.0));
+    assert_eq!(reopened.model().sheets[0].row_heights.get(&0), Some(&30.0));
+    reopened.undo(CalculationOptions::default()).unwrap();
+    assert_eq!(
+        reopened.model().sheets[0].hidden_col_widths.get(&0),
+        Some(&20.0)
+    );
+    assert_eq!(
+        reopened.model().sheets[0].hidden_row_heights.get(&0),
+        Some(&30.0)
+    );
+    reopened.redo(CalculationOptions::default()).unwrap();
+    assert_eq!(reopened.model().sheets[0].col_widths.get(&0), Some(&20.0));
+    assert_eq!(reopened.model().sheets[0].row_heights.get(&0), Some(&30.0));
 }
 
 #[test]
@@ -9234,4 +9151,193 @@ fn hidden_custom_sizes_survive_bounded_workbook_snapshots() {
         .unwrap();
     assert_eq!(restored.model().sheets[0].col_widths.get(&0), Some(&20.0));
     assert_eq!(restored.model().sheets[0].row_heights.get(&0), Some(&30.0));
+}
+
+fn hidden_custom_sizes_source() -> Vec<u8> {
+    let mut sheet = Sheet::new("Sized");
+    sheet.col_widths.insert(0, 0.0);
+    sheet.hidden_col_widths.insert(0, 24.0);
+    sheet.row_heights.insert(0, 0.0);
+    sheet.hidden_row_heights.insert(0, 30.0);
+    let model = WorkbookModel {
+        sheets: vec![sheet],
+        ..Default::default()
+    };
+    ooxml_opc::rezip_parts(&xlsx_parse::serialize_workbook(&model).unwrap()).unwrap()
+}
+
+fn assert_no_shared_hidden_sizes(workbook: &Workbook) {
+    use yrs::Transact;
+    use yrs::types::ToJson;
+    let doc = yrs::Doc::new();
+    doc.transact_mut()
+        .apply_update(YrsUpdate::decode_v1(&workbook.encode_state_as_update_v1()).unwrap())
+        .unwrap();
+    doc.get_or_insert_map("xlsx");
+    doc.get_or_insert_map("xlsx:sheets");
+    doc.get_or_insert_map("xlsx:cell-formats");
+    doc.get_or_insert_array("xlsx:sheet-order");
+    let txn = doc.transact();
+    let json = doc.to_json(&txn).to_string();
+    assert!(!json.contains("hiddenColWidths"), "{json}");
+    assert!(!json.contains("hiddenRowHeights"), "{json}");
+    assert!(workbook.model().sheets[0].hidden_col_widths.is_empty());
+    assert!(workbook.model().sheets[0].hidden_row_heights.is_empty());
+}
+
+#[test]
+fn collaborative_hidden_sizes_keep_main_schema_six_identity() {
+    let source = hidden_custom_sizes_source();
+    let mut stripped = Workbook::open(&source).unwrap().model().clone();
+    for sheet in &mut stripped.sheets {
+        sheet.hidden_col_widths.clear();
+        sheet.hidden_row_heights.clear();
+    }
+    let expected = Workbook::from_model_collaborative(stripped, 886).unwrap();
+    let actual = Workbook::open_collaborative(&source, 886).unwrap();
+    assert_eq!(
+        actual.encode_state_vector_v1(),
+        expected.encode_state_vector_v1()
+    );
+    assert_eq!(
+        actual.encode_state_as_update_v1(),
+        expected.encode_state_as_update_v1()
+    );
+    assert_no_shared_hidden_sizes(&actual);
+}
+
+#[test]
+fn collaborative_hidden_sizes_never_write_shared_keys() {
+    let source = hidden_custom_sizes_source();
+    let mut stripped = Workbook::open(&source).unwrap().model().clone();
+    stripped.sheets[0].hidden_col_widths.clear();
+    stripped.sheets[0].hidden_row_heights.clear();
+    let mut expected = Workbook::from_model_collaborative(stripped, 887).unwrap();
+    let mut workbook = Workbook::open_collaborative(&source, 887).unwrap();
+    assert_no_shared_hidden_sizes(&workbook);
+    for ops in [
+        vec![
+            Op::SetColWidth {
+                sheet: SheetId(0),
+                col: 0,
+                width: Some(25.0),
+            },
+            Op::SetRowHeight {
+                sheet: SheetId(0),
+                row: 0,
+                height: Some(35.0),
+            },
+        ],
+        vec![
+            Op::SetColVisibility {
+                sheet: SheetId(0),
+                col: 0,
+                hidden: true,
+            },
+            Op::SetRowVisibility {
+                sheet: SheetId(0),
+                row: 0,
+                hidden: true,
+            },
+        ],
+        vec![
+            Op::SetColVisibility {
+                sheet: SheetId(0),
+                col: 0,
+                hidden: false,
+            },
+            Op::SetRowVisibility {
+                sheet: SheetId(0),
+                row: 0,
+                hidden: false,
+            },
+        ],
+    ] {
+        expected
+            .apply_ops(ops.clone(), CalculationOptions::default())
+            .unwrap();
+        workbook
+            .apply_ops(ops, CalculationOptions::default())
+            .unwrap();
+        assert_no_shared_hidden_sizes(&workbook);
+        assert_eq!(
+            workbook.encode_state_vector_v1(),
+            expected.encode_state_vector_v1()
+        );
+        assert_eq!(
+            workbook.encode_state_as_update_v1(),
+            expected.encode_state_as_update_v1()
+        );
+    }
+    expected.undo(CalculationOptions::default()).unwrap();
+    workbook.undo(CalculationOptions::default()).unwrap();
+    assert_no_shared_hidden_sizes(&workbook);
+    assert_eq!(
+        workbook.encode_state_vector_v1(),
+        expected.encode_state_vector_v1()
+    );
+    assert_eq!(
+        workbook.encode_state_as_update_v1(),
+        expected.encode_state_as_update_v1()
+    );
+}
+
+#[test]
+fn collaborative_hidden_sizes_concurrent_first_hides_use_main_maps() {
+    let mut sheet = Sheet::new("Sized");
+    for index in 0..2 {
+        sheet.col_widths.insert(index, 24.0 + f64::from(index));
+        sheet.row_heights.insert(index, 30.0 + f64::from(index));
+    }
+    let model = WorkbookModel {
+        sheets: vec![sheet],
+        ..Default::default()
+    };
+    let source = ooxml_opc::rezip_parts(&xlsx_parse::serialize_workbook(&model).unwrap()).unwrap();
+    let mut left = Workbook::open_collaborative(&source, 888).unwrap();
+    let mut right = Workbook::open_collaborative(&source, 889).unwrap();
+    for (workbook, index) in [(&mut left, 0), (&mut right, 1)] {
+        workbook
+            .apply_ops(
+                vec![
+                    Op::SetColVisibility {
+                        sheet: SheetId(0),
+                        col: index,
+                        hidden: true,
+                    },
+                    Op::SetRowVisibility {
+                        sheet: SheetId(0),
+                        row: index,
+                        hidden: true,
+                    },
+                ],
+                CalculationOptions::default(),
+            )
+            .unwrap();
+    }
+    let to_left = right
+        .encode_diff_v1(&left.encode_state_vector_v1())
+        .unwrap();
+    let to_right = left
+        .encode_diff_v1(&right.encode_state_vector_v1())
+        .unwrap();
+    left.apply_update_v1(&to_left, CalculationOptions::default())
+        .unwrap();
+    right
+        .apply_update_v1(&to_right, CalculationOptions::default())
+        .unwrap();
+    assert_eq!(left.model(), right.model());
+    for workbook in [&left, &right] {
+        assert_no_shared_hidden_sizes(workbook);
+        for index in 0..2 {
+            assert_eq!(
+                workbook.model().sheets[0].col_widths.get(&index),
+                Some(&0.0)
+            );
+            assert_eq!(
+                workbook.model().sheets[0].row_heights.get(&index),
+                Some(&0.0)
+            );
+        }
+    }
 }

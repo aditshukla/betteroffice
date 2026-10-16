@@ -690,6 +690,12 @@ impl Workbook {
             validate_collaboration_state_entries(authority.state_vector_entries())?;
         }
         retain_array_formulas(&model, &mut projected);
+        if client_id.is_none() {
+            for (source, target) in model.sheets.iter().zip(&mut projected.sheets) {
+                target.hidden_col_widths = source.hidden_col_widths.clone();
+                target.hidden_row_heights = source.hidden_row_heights.clone();
+            }
+        }
         let model = projected;
         validate_model(&model)?;
         let opened_anchors = model
@@ -5021,6 +5027,12 @@ impl Workbook {
         }
         let mut projected = authority.materialize_oracle().map_err(authority_error)?;
         retain_array_formulas(&model, &mut projected);
+        if client_id.is_none() {
+            for (source, target) in model.sheets.iter().zip(&mut projected.sheets) {
+                target.hidden_col_widths = source.hidden_col_widths.clone();
+                target.hidden_row_heights = source.hidden_row_heights.clone();
+            }
+        }
         let model = projected;
         validate_model(&model)?;
         let opened_anchors = model
