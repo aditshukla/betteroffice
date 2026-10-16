@@ -811,6 +811,11 @@ impl Workbook {
         matches!(self.mode, WorkbookMode::Collaborative { .. })
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_pending_updates_for_test(&self) -> bool {
+        !self.pending_remote_updates.is_empty() || self.authority.has_pending_updates()
+    }
+
     pub fn encode_state_vector_v1(&self) -> Vec<u8> {
         self.authority.encode_state_vector_v1()
     }
@@ -3897,6 +3902,14 @@ fn validate_op(model: &WorkbookModel, op: &Op) -> Result<()> {
         Op::MergeCells { sheet, range } | Op::UnmergeCells { sheet, range } => {
             require_sheet(model, *sheet)?;
             validate_range(*range)?;
+            if matches!(op, Op::MergeCells { .. })
+                && range.start.row == range.end.row
+                && range.start.col == range.end.col
+            {
+                return Err(Error::InvalidOperation(
+                    "merged range must contain at least two cells".to_string(),
+                ));
+            }
         }
         Op::PatchRangeStyle { sheet, range, .. }
         | Op::SetRangeNumberFormat { sheet, range, .. }

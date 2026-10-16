@@ -681,6 +681,7 @@ enum HistoryAction {
 #[cfg(test)]
 thread_local! {
     pub(crate) static SNAPSHOT_VECTOR_ENCODINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SCHEMA_SIX_KEY_VALIDATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static LOCAL_UPDATE_ENCODINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -1063,11 +1064,6 @@ impl WorkbookAuthority {
             return Ok(self.encode_ops_update(state_vector));
         }
         let mut model = self.materialize()?;
-        let before_merges = model
-            .sheets
-            .iter()
-            .map(|sheet| sheet.merges.clone())
-            .collect::<Vec<_>>();
         model.styles.bind_plain_xf();
         let ops =
             remap_styles(ops, styles, &mut model.styles).map_err(AuthorityError::InvalidState)?;
@@ -1098,15 +1094,8 @@ impl WorkbookAuthority {
         if self.base.tables != model.tables {
             Arc::make_mut(&mut self.base).tables = model.tables.clone();
         }
-        self.sync_model(
-            &model,
-            ops,
-            origin,
-            &authored_styles,
-            &before_merges,
-            collaborative,
-        )
-        .map_err(AuthorityError::InvalidState)?;
+        self.sync_model(&model, ops, origin, &authored_styles, collaborative)
+            .map_err(AuthorityError::InvalidState)?;
         if let [Op::SetCell { at, cell, .. }] = ops
             && at.row < MAX_ROWS
             && at.col < MAX_COLS
@@ -2180,7 +2169,6 @@ impl WorkbookAuthority {
         ops: &[Op],
         origin: SyncOrigin,
         authored_styles: &HashMap<(u32, CellRef), Option<u32>>,
-        before_merges: &[Vec<CellRange>],
         collaborative: bool,
     ) -> Result<(), String> {
         let current_keys = self.current_sheet_keys()?;
@@ -2394,22 +2382,10 @@ impl WorkbookAuthority {
                     clear_merge_edits(&sheet_map, &mut txn);
                     continue;
                 }
-                let index = keys
-                    .iter()
-                    .position(|candidate| candidate == &key)
-                    .ok_or_else(|| format!("sheet {key} is not active"))?;
-                let previous = before_merges
-                    .get(index)
-                    .ok_or_else(|| format!("sheet {key} has no prior merge state"))?;
-
                 let Some(Out::Any(baseline)) = sheet_map.get(&txn, MERGES) else {
                     return Err(format!("sheet {key} is missing merges"));
                 };
                 let baseline_keys = merges_from_any(&baseline)?
-                    .iter()
-                    .map(CellRange::to_a1)
-                    .collect::<BTreeSet<_>>();
-                let previous_keys = previous
                     .iter()
                     .map(CellRange::to_a1)
                     .collect::<BTreeSet<_>>();
@@ -2418,28 +2394,25 @@ impl WorkbookAuthority {
                     .iter()
                     .map(CellRange::to_a1)
                     .collect::<BTreeSet<_>>();
-                for range in previous
-                    .iter()
-                    .filter(|range| !current_keys.contains(&range.to_a1()))
-                {
-                    let range_key = range.to_a1();
+                let mut edit_keys = sheet_map
+                    .keys(&txn)
+                    .filter_map(|key| key.strip_prefix(MERGE_PREFIX).map(str::to_string))
+                    .collect::<BTreeSet<_>>();
+                edit_keys.extend(baseline_keys.iter().cloned());
+                edit_keys.extend(current_keys.iter().cloned());
+                for range_key in edit_keys {
                     let edit_key = format!("{MERGE_PREFIX}{range_key}");
-                    if baseline_keys.contains(&range_key) {
-                        sheet_map.try_update(&mut txn, edit_key, false);
-                    } else {
-                        sheet_map.remove(&mut txn, &edit_key);
+                    match (
+                        baseline_keys.contains(&range_key),
+                        current_keys.contains(&range_key),
+                    ) {
+                        (true, true) | (false, false) => {
+                            sheet_map.remove(&mut txn, &edit_key);
+                        }
+                        (_, present) => {
+                            sheet_map.try_update(&mut txn, edit_key, present);
+                        }
                     }
-                }
-                for range in sheet_model
-                    .merges
-                    .iter()
-                    .filter(|range| !previous_keys.contains(&range.to_a1()))
-                {
-                    sheet_map.try_update(
-                        &mut txn,
-                        format!("{MERGE_PREFIX}{}", range.to_a1()),
-                        true,
-                    );
                 }
             }
         }
@@ -4654,6 +4627,10 @@ fn require_sheet_keys<T: ReadTxn>(
     optional: &[&str],
     label: &str,
 ) -> Result<(), String> {
+    #[cfg(test)]
+    if SCHEMA_SIX_KEY_VALIDATION.get() {
+        return require_map_keys_with_optional(map, txn, expected, optional, label);
+    }
     if expected.iter().any(|key| map.get(txn, key).is_none()) {
         return Err(format!("{label} keys do not match the schema"));
     }
@@ -4881,6 +4858,7 @@ fn merges_from_any(value: &Any) -> Result<Vec<CellRange>, String> {
     let Any::Array(merges) = value else {
         return Err("sheet merges are not an array".to_string());
     };
+    let mut projection = MergeProjection::new(MergeEdits::new());
     merges
         .iter()
         .map(|merge| {
@@ -4890,7 +4868,7 @@ fn merges_from_any(value: &Any) -> Result<Vec<CellRange>, String> {
             if values.len() != 8 {
                 return Err("merge entry must contain eight values".to_string());
             }
-            Ok(CellRange {
+            let range = CellRange {
                 start: CellRef {
                     row: any_u32(&values[0], "merge start row")?,
                     col: any_u32(&values[1], "merge start column")?,
@@ -4903,7 +4881,9 @@ fn merges_from_any(value: &Any) -> Result<Vec<CellRange>, String> {
                     abs_row: any_bool(&values[6], "merge end absolute row")?,
                     abs_col: any_bool(&values[7], "merge end absolute column")?,
                 },
-            })
+            };
+            let _ = projection.baseline(range)?;
+            Ok(range)
         })
         .collect()
 }
@@ -8353,8 +8333,8 @@ mod tests {
                 .unwrap();
             for (key, present) in [
                 ("merge:C1:C2", true),
-                ("merge:$G$1:$H$2", true),
-                ("merge:J1", false),
+                ("merge:G1:H2", true),
+                ("merge:J1:K2", false),
                 ("merge:D4:E5", true),
             ] {
                 sheet.try_update(&mut txn, key, present);
@@ -8364,9 +8344,269 @@ mod tests {
         assert_eq!(&projected.sheets[0].merges[..2], model.sheets[0].merges);
         assert!(authority.materialize_internal_oracle(true).is_err());
         snapshot_validation::validate_for_test(&authority, projected.clone()).unwrap();
-        assert!(snapshot_validation::validate_for_test(&authority, model).is_err());
+        assert!(snapshot_validation::validate_for_test(&authority, model.clone()).is_err());
         let peer = WorkbookAuthority::from_model_with_client_id(&projected, 131).unwrap();
         assert_ne!(authority.base.fingerprint, peer.base.fingerprint);
+
+        let mut old = crate::Workbook::from_model_collaborative(model.clone(), 132).unwrap();
+        let mut current = crate::Workbook::from_model_collaborative(model, 133).unwrap();
+        let before_vector = old.encode_state_vector_v1();
+        let before_bytes = old.encode_state_as_update_v1();
+        let before_model = old.model().clone();
+        let options = crate::CalculationOptions::default();
+        current
+            .apply_ops(
+                vec![
+                    Op::MergeCells {
+                        sheet: SheetId(0),
+                        range: CellRange::parse_a1("J1:K2").unwrap(),
+                    },
+                    Op::SetCell {
+                        sheet: SheetId(0),
+                        at: CellRef::new(20, 0),
+                        cell: CellState {
+                            value: CellValue::Text {
+                                value: "new value".into(),
+                            },
+                            ..Default::default()
+                        },
+                    },
+                ],
+                options,
+            )
+            .unwrap();
+        let update = current.encode_diff_v1(&before_vector).unwrap();
+        SCHEMA_SIX_KEY_VALIDATION.set(true);
+        let result = old.apply_update_v1(&update, options);
+        SCHEMA_SIX_KEY_VALIDATION.set(false);
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("sheet sheet:0 keys do not match the schema"),
+            "{error}"
+        );
+        assert_eq!(old.encode_state_vector_v1(), before_vector);
+        assert_eq!(old.encode_state_as_update_v1(), before_bytes);
+        assert_eq!(old.model(), &before_model);
+        assert!(!old.has_pending_updates_for_test());
+    }
+
+    #[test]
+    fn local_merge_edits_remove_shadowed_keys() {
+        let mut model = WorkbookModel::default();
+        model.sheets.push(Sheet::new("Merges"));
+        let options = crate::CalculationOptions::default();
+        for unmerge in [false, true] {
+            let mut left = crate::Workbook::from_model_collaborative(model.clone(), 180).unwrap();
+            let mut right = crate::Workbook::from_model_collaborative(model.clone(), 181).unwrap();
+            for (peer, range) in [(&mut left, "A1:B2"), (&mut right, "B2:C3")] {
+                peer.apply_ops(
+                    vec![Op::MergeCells {
+                        sheet: SheetId(0),
+                        range: CellRange::parse_a1(range).unwrap(),
+                    }],
+                    options,
+                )
+                .unwrap();
+            }
+            let update = right
+                .encode_diff_v1(&left.encode_state_vector_v1())
+                .unwrap();
+            left.apply_update_v1(&update, options).unwrap();
+            assert_eq!(
+                left.model().sheets[0].merges,
+                vec![CellRange::parse_a1("A1:B2").unwrap()]
+            );
+            let replacement = CellRange::parse_a1("B2:D4").unwrap();
+            let op = if unmerge {
+                Op::UnmergeCells {
+                    sheet: SheetId(0),
+                    range: CellRange::parse_a1("A1:B2").unwrap(),
+                }
+            } else {
+                Op::MergeCells {
+                    sheet: SheetId(0),
+                    range: replacement,
+                }
+            };
+            left.apply_ops(vec![op], options).unwrap();
+            let expected = if unmerge { vec![] } else { vec![replacement] };
+            assert_eq!(left.model().sheets[0].merges, expected);
+            right
+                .apply_update_v1(
+                    &left
+                        .encode_diff_v1(&right.encode_state_vector_v1())
+                        .unwrap(),
+                    options,
+                )
+                .unwrap();
+            assert_eq!(left.model(), right.model());
+            let doc = Doc::new();
+            hydrate_doc(&doc, &left.encode_state_as_update_v1()).unwrap();
+            let txn = doc.transact();
+            let sheet = txn
+                .get_map(SHEETS)
+                .unwrap()
+                .get(&txn, "sheet:0")
+                .unwrap()
+                .cast::<MapRef>()
+                .unwrap();
+            let keys = sheet
+                .keys(&txn)
+                .filter(|key| key.starts_with(MERGE_PREFIX))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                keys,
+                if unmerge {
+                    BTreeSet::new()
+                } else {
+                    BTreeSet::from(["merge:B2:D4"])
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn local_merge_ranges_normalize_anchors() {
+        let range = CellRange::parse_a1("A1:B2").unwrap();
+        let options = crate::CalculationOptions::default();
+        for collaborative in [false, true] {
+            for imported in [false, true] {
+                let mut model = WorkbookModel::default();
+                let mut sheet = Sheet::new("Merges");
+                if imported {
+                    sheet.merges.push(range);
+                }
+                model.sheets.push(sheet);
+                let mut workbook = if collaborative {
+                    crate::Workbook::from_model_collaborative(model, 182).unwrap()
+                } else {
+                    crate::Workbook::from_model(model).unwrap()
+                };
+                if !imported {
+                    workbook
+                        .apply_ops(
+                            vec![Op::MergeCells {
+                                sheet: SheetId(0),
+                                range: CellRange::parse_a1("$A$1:$B$2").unwrap(),
+                            }],
+                            options,
+                        )
+                        .unwrap();
+                    assert_eq!(workbook.model().sheets[0].merges, vec![range]);
+                    let reopened = crate::Workbook::open(&workbook.save().unwrap()).unwrap();
+                    assert_eq!(reopened.model().sheets[0].merges, vec![range]);
+                    let doc = Doc::new();
+                    hydrate_doc(&doc, &workbook.encode_state_as_update_v1()).unwrap();
+                    let txn = doc.transact();
+                    let sheet = txn
+                        .get_map(SHEETS)
+                        .unwrap()
+                        .get(&txn, "sheet:0")
+                        .unwrap()
+                        .cast::<MapRef>()
+                        .unwrap();
+                    assert!(sheet.keys(&txn).all(|key| !key.contains('$')));
+                    let Out::Any(baseline) = sheet.get(&txn, MERGES).unwrap() else {
+                        panic!("missing merges")
+                    };
+                    assert!(
+                        merges_from_any(&baseline)
+                            .unwrap()
+                            .iter()
+                            .all(|range| !range.to_a1().contains('$'))
+                    );
+                }
+                workbook
+                    .apply_ops(
+                        vec![Op::UnmergeCells {
+                            sheet: SheetId(0),
+                            range: CellRange::parse_a1("$A1:B$2").unwrap(),
+                        }],
+                        options,
+                    )
+                    .unwrap();
+                assert!(workbook.model().sheets[0].merges.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn overlapping_merge_baselines_are_refused_by_both_validators() {
+        let mut model = WorkbookModel::default();
+        let mut sheet = Sheet::new("Merges");
+        sheet.merges.push(CellRange::parse_a1("A1:B2").unwrap());
+        model.sheets.push(sheet);
+        for edit in [
+            None,
+            Some(("merge:D1:E2", true)),
+            Some(("merge:B2:C3", false)),
+        ] {
+            let authority = WorkbookAuthority::from_model_with_client_id(&model, 183).unwrap();
+            let mut projected = model.clone();
+            {
+                let mut txn = authority.doc.transact_mut();
+                let sheet = txn
+                    .get_map(SHEETS)
+                    .unwrap()
+                    .get(&txn, "sheet:0")
+                    .unwrap()
+                    .cast::<MapRef>()
+                    .unwrap();
+                sheet.try_update(
+                    &mut txn,
+                    MERGES,
+                    merges_to_any(&[
+                        CellRange::parse_a1("A1:B2").unwrap(),
+                        CellRange::parse_a1("B2:C3").unwrap(),
+                    ]),
+                );
+                if let Some((key, present)) = edit {
+                    sheet.try_update(&mut txn, key, present);
+                    if present {
+                        projected.sheets[0]
+                            .merges
+                            .push(CellRange::parse_a1("D1:E2").unwrap());
+                    }
+                }
+            }
+            let strict = authority.strict_materialize();
+            let snapshot = snapshot_validation::validate_for_test(&authority, projected);
+            assert!(strict.is_err(), "strict accepted {edit:?}");
+            assert!(snapshot.is_err(), "snapshot accepted {edit:?}");
+            assert!(strict.unwrap_err().contains("merged cell ranges overlap"));
+            assert!(
+                snapshot
+                    .unwrap_err()
+                    .to_string()
+                    .contains("merged cell ranges overlap")
+            );
+        }
+    }
+
+    #[test]
+    fn local_single_cell_merges_are_refused() {
+        let mut model = WorkbookModel::default();
+        model.sheets.push(Sheet::new("Merges"));
+        for collaborative in [false, true] {
+            let mut workbook = if collaborative {
+                crate::Workbook::from_model_collaborative(model.clone(), 184).unwrap()
+            } else {
+                crate::Workbook::from_model(model.clone()).unwrap()
+            };
+            let before = workbook.encode_state_as_update_v1();
+            for address in ["A1", "$A1:A$1"] {
+                let result = workbook.apply_ops(
+                    vec![Op::MergeCells {
+                        sheet: SheetId(0),
+                        range: CellRange::parse_a1(address).unwrap(),
+                    }],
+                    crate::CalculationOptions::default(),
+                );
+                assert!(matches!(result, Err(crate::Error::InvalidOperation(_))));
+                assert_eq!(workbook.encode_state_as_update_v1(), before);
+                assert!(workbook.model().sheets[0].merges.is_empty());
+            }
+        }
     }
 
     #[test]
@@ -8537,6 +8777,10 @@ mod tests {
             (120, "", Any::Bool(true)),
             (121, "A1:B2", Any::Null),
             (122, "A1:B2", Any::from(1)),
+            (123, "$A$1:$B$2", Any::Bool(true)),
+            (124, "$A1:B2", Any::Bool(false)),
+            (125, "A1", Any::Bool(true)),
+            (126, "A1", Any::Bool(false)),
         ] {
             let authority =
                 WorkbookAuthority::from_model_with_client_id(&model, client_id).unwrap();

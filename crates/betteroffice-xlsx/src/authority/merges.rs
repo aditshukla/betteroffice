@@ -15,6 +15,8 @@ fn merge_edit(key: &str, value: &Out) -> Result<(CellRange, bool), String> {
     let range =
         CellRange::parse_a1(range_key).map_err(|_| format!("invalid merge edit key {key}"))?;
     if range.to_a1() != range_key
+        || range_key.contains('$')
+        || range.start == range.end
         || range.start.row >= MAX_ROWS
         || range.end.row >= MAX_ROWS
         || range.start.col >= MAX_COLS
@@ -78,6 +80,7 @@ pub(super) struct MergeProjection {
     edits: MergeEdits,
     changed: bool,
     occupied: MergeIndex,
+    baseline_occupied: MergeIndex,
 }
 
 impl MergeProjection {
@@ -86,18 +89,22 @@ impl MergeProjection {
             changed: !edits.is_empty(),
             edits,
             occupied: MergeIndex::default(),
+            baseline_occupied: MergeIndex::default(),
         }
     }
 
     pub(super) fn baseline(&mut self, range: CellRange) -> Result<Option<CellRange>, String> {
-        if self.changed
-            && (range.start.row > range.end.row
-                || range.start.col > range.end.col
-                || range.end.row >= MAX_ROWS
-                || range.end.col >= MAX_COLS)
+        if range.start.row > range.end.row
+            || range.start.col > range.end.col
+            || range.end.row >= MAX_ROWS
+            || range.end.col >= MAX_COLS
         {
             return Err("merge baseline is out of bounds".to_string());
         }
+        if self.baseline_occupied.overlaps(1, 0, MAX_COLS - 1, &range) {
+            return Err("merged cell ranges overlap".to_string());
+        }
+        self.baseline_occupied.insert(1, 0, MAX_COLS - 1, &range);
         if self
             .edits
             .remove(&range.to_a1())
@@ -199,6 +206,25 @@ impl MergeIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anchored_merge_keys_are_refused() {
+        for key in ["merge:$A$1:$B$2", "merge:$A1:B2", "merge:A1:B$2"] {
+            for present in [false, true] {
+                assert!(
+                    merge_edit(key, &Out::Any(Any::Bool(present))).is_err(),
+                    "{key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn single_cell_merge_keys_are_refused() {
+        for present in [false, true] {
+            assert!(merge_edit("merge:A1", &Out::Any(Any::Bool(present))).is_err());
+        }
+    }
 
     #[test]
     fn merge_interval_index_matches_rectangle_overlap() {
