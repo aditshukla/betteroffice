@@ -56,6 +56,24 @@ pub(crate) fn common_slide_data(
     budget: &mut ParseBudget<'_>,
     elements: ShapeElements,
 ) -> Result<CommonSlideData, PptxError> {
+    common_slide_data_with_vml(
+        root,
+        relationships,
+        part,
+        budget,
+        elements,
+        &BTreeMap::new(),
+    )
+}
+
+pub(crate) fn common_slide_data_with_vml(
+    root: &XmlElement,
+    relationships: &[Relationship],
+    part: &str,
+    budget: &mut ParseBudget<'_>,
+    elements: ShapeElements,
+    previews: &BTreeMap<String, PictureFill>,
+) -> Result<CommonSlideData, PptxError> {
     let common = root.child("cSld");
     let name = common
         .and_then(|value| value.attribute("name"))
@@ -76,7 +94,7 @@ pub(crate) fn common_slide_data(
             color: parse_color_container(reference),
         });
     let mut shapes = if let Some(tree) = common.and_then(|value| value.child("spTree")) {
-        parse_shape_children(tree, relationships, part, budget, elements)?
+        parse_shape_children(tree, relationships, part, budget, elements, previews)?
     } else {
         Vec::new()
     };
@@ -137,7 +155,14 @@ pub(crate) fn parse_diagram_drawing(
     let Some(tree) = root.descendants_named("spTree").first().copied() else {
         return Ok(Vec::new());
     };
-    parse_shape_children(tree, relationships, part, budget, elements)
+    parse_shape_children(
+        tree,
+        relationships,
+        part,
+        budget,
+        elements,
+        &BTreeMap::new(),
+    )
 }
 
 fn parse_shape_children(
@@ -146,6 +171,7 @@ fn parse_shape_children(
     part: &str,
     budget: &mut ParseBudget<'_>,
     elements: ShapeElements,
+    previews: &BTreeMap<String, PictureFill>,
 ) -> Result<Vec<ShapeNode>, PptxError> {
     let mut shapes = Vec::new();
     for child in parent.child_elements() {
@@ -157,6 +183,7 @@ fn parse_shape_children(
                     part,
                     budget,
                     elements,
+                    previews,
                 )?);
             }
             continue;
@@ -180,6 +207,7 @@ fn parse_shape_children(
                 relationships,
                 part,
                 budget,
+                previews,
             )?)),
             "grpSp" => Some(ShapeNode::Group(parse_group(
                 child,
@@ -187,6 +215,7 @@ fn parse_shape_children(
                 part,
                 budget,
                 elements,
+                previews,
             )?)),
             _ => None,
         };
@@ -344,8 +373,10 @@ fn parse_graphic_frame(
     relationships: &[Relationship],
     part: &str,
     budget: &mut ParseBudget<'_>,
+    previews: &BTreeMap<String, PictureFill>,
 ) -> Result<GraphicFrame, PptxError> {
     budget.charge_shape(part)?;
+    let base = parse_base(element.child("nvGraphicFramePr"), element.child("xfrm"));
     let data = element
         .child("graphic")
         .and_then(|value| value.child("graphicData"));
@@ -382,7 +413,7 @@ fn parse_graphic_frame(
         }
     } else {
         let uri = data.and_then(|value| value.attribute("uri"));
-        let picture = data
+        let object = data
             .filter(|_| uri == Some("http://schemas.openxmlformats.org/presentationml/2006/ole"))
             .and_then(|value| {
                 value
@@ -390,10 +421,29 @@ fn parse_graphic_frame(
                     .and_then(|alternate| alternate.child("Fallback"))
                     .unwrap_or(value)
                     .child("oleObj")
-            })
+            });
+        let picture = object
             .and_then(|object| object.child("pic"))
             .map(|picture| parse_picture(picture, relationships, part, budget))
             .transpose()?
+            .or_else(|| {
+                let preview = object
+                    .and_then(|object| object.attribute("spid"))
+                    .and_then(|spid| previews.get(spid))?;
+                Some(Picture {
+                    base: base.clone(),
+                    relationship_id: None,
+                    media_part_path: preview.media_part_path.clone(),
+                    crop: PictureCrop::default(),
+                    effects: Vec::new(),
+                    geometry: "rect".to_owned(),
+                    adjust_values: BTreeMap::new(),
+                    fill: None,
+                    outline: None,
+                    shape_effects: None,
+                    style: None,
+                })
+            })
             .map(Box::new);
         GraphicFrameData::Unknown {
             uri: uri.map(str::to_owned),
@@ -401,7 +451,7 @@ fn parse_graphic_frame(
         }
     };
     Ok(GraphicFrame {
-        base: parse_base(element.child("nvGraphicFramePr"), element.child("xfrm")),
+        base,
         data: frame_data,
     })
 }
@@ -528,10 +578,12 @@ fn parse_group(
     part: &str,
     budget: &mut ParseBudget<'_>,
     elements: ShapeElements,
+    previews: &BTreeMap<String, PictureFill>,
 ) -> Result<GroupShape, PptxError> {
     budget.charge_shape(part)?;
     let own_fill = element.child("grpSpPr").and_then(parse_fill);
-    let mut children = parse_shape_children(element, relationships, part, budget, elements)?;
+    let mut children =
+        parse_shape_children(element, relationships, part, budget, elements, previews)?;
     if let Some(fill) = own_fill
         .as_ref()
         .filter(|fill| fill.fill_type != GROUP_FILL)
@@ -1492,6 +1544,11 @@ pub(crate) fn parse_run_properties(element: Option<&XmlElement>) -> RunPropertie
             .attribute("baseline")
             .and_then(|value| value.parse::<i32>().ok())
             .map(|value| f64::from(value) / 1000.0),
+        kern_pt: element
+            .attribute("kern")
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|value| (0..=400_000).contains(value))
+            .map(|value| f64::from(value) / 100.0),
         bold: element.attribute("b").map(parse_bool),
         italic: element.attribute("i").map(parse_bool),
         underline: element.attribute("u").map(str::to_owned),
@@ -1577,6 +1634,27 @@ mod tests {
     use crate::ParseLimits;
     use crate::xml::parse_xml;
     use ooxml_drawingml::GeometryPathCommand;
+
+    #[test]
+    fn a_kern_threshold_reads_in_points_within_the_schema_range() {
+        let limits = ParseLimits::default();
+        let kern = |attribute: &str| {
+            let xml = format!(r#"<a:rPr {attribute}/>"#);
+            let root = parse_xml(
+                xml.as_bytes(),
+                "ppt/slides/slide1.xml",
+                &mut ParseBudget::new(&limits),
+            )
+            .unwrap();
+            parse_run_properties(Some(&root)).kern_pt
+        };
+        assert_eq!(kern(r#"kern="1200""#), Some(12.0));
+        assert_eq!(kern(r#"kern="0""#), Some(0.0));
+        assert_eq!(kern(r#"kern="-100""#), None);
+        assert_eq!(kern(r#"kern="400000""#), Some(4_000.0));
+        assert_eq!(kern(r#"kern="400001""#), None);
+        assert_eq!(kern(r#"sz="1100""#), None);
+    }
 
     #[test]
     fn a_custom_geometry_becomes_a_path_normalised_to_the_shape() {
@@ -2710,7 +2788,14 @@ mod tests {
         let limits = ParseLimits::default();
         let mut budget = ParseBudget::new(&limits);
         let root = parse_xml(br#"<p:graphicFrame><a:graphic><a:graphicData uri="custom:graphic"><p:oleObj><p:pic><p:blipFill><a:blip r:embed="rId1"/></p:blipFill></p:pic></p:oleObj></a:graphicData></a:graphic></p:graphicFrame>"#, "ppt/slides/slide1.xml", &mut budget).unwrap();
-        let frame = parse_graphic_frame(&root, &[], "ppt/slides/slide1.xml", &mut budget).unwrap();
+        let frame = parse_graphic_frame(
+            &root,
+            &[],
+            "ppt/slides/slide1.xml",
+            &mut budget,
+            &BTreeMap::new(),
+        )
+        .unwrap();
         let json = serde_json::to_string(&frame.data).unwrap();
         assert_eq!(json, r#"{"type":"unknown","uri":"custom:graphic"}"#);
         assert_eq!(

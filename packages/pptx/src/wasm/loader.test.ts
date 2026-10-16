@@ -723,6 +723,35 @@ test('inserted pictures render, synchronize, arrange and reopen with their bytes
 });
 
 describe('host undo and comment controls', () => {
+  for (const mode of ['auto', 'manual'] as const) {
+    test(`setStoryParagraphs restores the entire story in one ${mode} undo`, () => {
+      const seed = openPresentation(fixture, { clientId: 9970 });
+      let bytes: Uint8Array;
+      try {
+        const story = seed.snapshot().slides[0].shapes.find((shape) => shape.textStories.length)!.textStories[0];
+        seed.setStoryParagraphs(story.id, ['A', 'Keep this paragraph.'].map((text) => ({ runs: [{ text, style: {} }] })));
+        bytes = seed.save();
+      } finally { seed.dispose(); }
+      const deck = openPresentation(bytes, { clientId: 9971 });
+      try {
+        deck.setUndoCaptureMode(mode);
+        const original = deck.snapshot().slides[0].shapes.find((shape) => shape.textStories.length)!.textStories[0];
+        expect(original.paragraphs.map((paragraph) => paragraph.runs.map((run) => run.text).join('')))
+          .toEqual(['A', 'Keep this paragraph.']);
+        expect(deck.canUndo()).toBe(false);
+        const replacement = deck.setStoryParagraphs(original.id,
+          ['Left', 'Right'].map((text) => ({ runs: [{ text, style: {} }] })));
+        expect(replacement.paragraphs.map((paragraph) => paragraph.runs.map((run) => run.text).join('')))
+          .toEqual(['Left', 'Right']);
+        expect(deck.undo().applied).toBe(true);
+        expect(deck.story(original.id)).toEqual(original);
+        expect(deck.canUndo()).toBe(false);
+        expect(deck.redo().applied).toBe(true);
+        expect(deck.story(original.id)).toEqual(replacement);
+      } finally { deck.dispose(); }
+    });
+  }
+
   test('manual capture groups different operations and keeps explicit boundaries', () => {
     const deck = openPresentation(fixture, { clientId: 9981 });
     try {
@@ -744,6 +773,34 @@ describe('host undo and comment controls', () => {
       deck.setUndoCaptureMode('auto');
       expect(deck.canRedo()).toBe(true);
     } finally { deck.dispose(); }
+  });
+
+  test('caret anchors follow typing, undo, redo and remote edits as plain data', () => {
+    const deck = openPresentation(fixture, { clientId: 9982 });
+    const peer = openPresentation(fixture, { clientId: 9983, initialUpdate: deck.encodeStateAsUpdate() });
+    try {
+      const story = deck.snapshot().slides[0].shapes.find((shape) => shape.textStories.length)!
+        .textStories[0];
+      const first = deck.story(story.id).paragraphs[0].runs[0].text[0];
+      deck.addUndoBoundary();
+      deck.insertText(story.id, 0, first);
+      const anchor = JSON.parse(JSON.stringify(deck.anchorCaret(story.id, 1)));
+      expect(Object.keys(anchor).sort()).toEqual(['position', 'storyId']);
+      deck.undo();
+      expect(deck.resolveCaretAnchor(anchor)).toBe(0);
+      deck.redo();
+      expect(deck.resolveCaretAnchor(anchor)).toBe(1);
+      peer.applyUpdate(deck.encodeStateAsUpdate());
+      peer.insertText(story.id, 0, 'Remote ');
+      deck.applyUpdate(peer.encodeStateAsUpdate());
+      expect(deck.resolveCaretAnchor(anchor)).toBe(8);
+      expect(peer.resolveCaretAnchor(anchor)).toBe(8);
+      expect(() => deck.anchorCaret(story.id, 100_000)).toThrow();
+      expect(() => deck.resolveCaretAnchor({ storyId: story.id, position: 'not base64!' })).toThrow();
+    } finally {
+      peer.dispose();
+      deck.dispose();
+    }
   });
 
   test('moves modern comments without losing their thread or exported position', async () => {

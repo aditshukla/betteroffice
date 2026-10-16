@@ -1,10 +1,11 @@
 //! spreadsheetml -> `xlsx_model::Workbook`. streaming; nothing is sized from a
 //! file-supplied `count`/`dimension`, cells and shared strings are capped.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use quick_xml::events::Event;
 use xlsx_model::addr::{MAX_COLS, MAX_ROWS};
+use xlsx_model::workbook::ColumnRuns;
 use xlsx_model::{
     Cell, CellRange, CellRef, CellValue, ColStyle, DateSystem, DefinedName, ErrorValue, FreezePane,
     Hyperlink, Sheet, SheetFormat, SheetId, Stylesheet, Table, Workbook,
@@ -13,15 +14,18 @@ use xlsx_model::{
 use crate::formula::SharedFormulas;
 use crate::styles::parse_stylesheet;
 use crate::xml::{
-    attr, collect_text, find_part, local_name, next_event, reader, resolve_part_path,
+    attr, collect_text, find_part, local_name, next_event, reader, resolve_entity,
+    resolve_part_path, xml_err,
 };
 use crate::{
-    MAX_CELLS, MAX_COL_STYLES, MAX_DEFINED_NAMES, MAX_HYPERLINKS, MAX_SHARED_STRINGS,
-    MAX_TABLE_COLUMNS, MAX_TABLES, ParseError,
+    MAX_CELLS, MAX_COL_STYLES, MAX_DEFINED_NAMES, MAX_HYPERLINKS, MAX_ROW_STYLES,
+    MAX_SHARED_STRINGS, MAX_TABLE_COLUMNS, MAX_TABLES, ParseError,
 };
 
 /// excel's row-height ceiling in points.
 const MAX_ROW_HEIGHT_PT: f64 = 409.5;
+/// excel's column-width ceiling in characters.
+const MAX_COL_WIDTH_CHARS: f64 = 255.0;
 
 /// parse a full workbook from opc parts, resolving sheets through the
 /// workbook relationships.
@@ -37,6 +41,7 @@ pub(crate) struct IndexedWorkbook {
     pub(crate) workbook: Workbook,
     pub(crate) active_sheet: SheetId,
     pub(crate) shared_string_cells: Vec<SharedStringCells>,
+    pub(crate) cell_facts: Vec<SourceCellFacts>,
     pub(crate) legacy_dimensions: Vec<LegacySheetDimensions>,
     /// The style table releases that needed an explicit `applyX` flag read,
     /// present only when it differs. A legacy collaboration fingerprint is the
@@ -45,6 +50,8 @@ pub(crate) struct IndexedWorkbook {
     /// The drawing and chart parts no sheet's charts were built from, which
     /// no save rewrites.
     pub(crate) declined_parts: Vec<String>,
+    /// Shared strings authored with formatted runs.
+    pub(crate) rich_shared_strings: BTreeSet<usize>,
 }
 
 /// One sheet's row heights and column widths as releases before `hidden` was
@@ -68,17 +75,18 @@ pub(crate) fn parse_workbook_indexed(
     let wb_rels = find_part(parts, "xl/_rels/workbook.xml.rels");
     let rels = wb_rels.map(parse_rels).transpose()?.unwrap_or_default();
 
-    let shared_strings = match typed_part(parts, wb_rels, "sharedStrings", "xl/sharedStrings.xml")?
-    {
-        Some(bytes) => parse_shared_strings(bytes)?,
-        None => Vec::new(),
-    };
+    let (shared_strings, rich_shared_strings) =
+        match typed_part(parts, wb_rels, "sharedStrings", "xl/sharedStrings.xml")? {
+            Some(bytes) => parse_shared_strings(bytes)?,
+            None => Default::default(),
+        };
     let styles_bytes = typed_part(parts, wb_rels, "styles", "xl/styles.xml")?;
     let theme_bytes = typed_part(parts, wb_rels, "theme", "xl/theme/theme1.xml")?;
-    let (styles, legacy_styles) = parse_stylesheet(styles_bytes, theme_bytes)?;
+    let (mut styles, legacy_styles) = parse_stylesheet(styles_bytes, theme_bytes)?;
 
     let mut sheets = Vec::with_capacity(meta.sheets.len());
     let mut shared_string_cells = Vec::with_capacity(meta.sheets.len());
+    let mut cell_facts = Vec::with_capacity(meta.sheets.len());
     let mut legacy_dimensions = Vec::with_capacity(meta.sheets.len());
     let mut declined_parts = Vec::new();
     let mut tables = Vec::new();
@@ -94,6 +102,7 @@ pub(crate) fn parse_workbook_indexed(
             }
             sheets.push(sheet);
             shared_string_cells.push(SharedStringCells::new());
+            cell_facts.push(SourceCellFacts::default());
             legacy_dimensions.push(LegacySheetDimensions::default());
             continue;
         }
@@ -105,6 +114,7 @@ pub(crate) fn parse_workbook_indexed(
             .unwrap_or_default();
         let mut indices = SharedStringCells::new();
         let mut legacy = LegacySheetDimensions::default();
+        let mut facts = SourceCellFacts::default();
         let mut sheet = parse_worksheet(
             &entry.name,
             bytes,
@@ -112,14 +122,25 @@ pub(crate) fn parse_workbook_indexed(
             &sheet_rels,
             &mut indices,
             &mut legacy,
+            &mut facts,
         )?;
         sheet.charts = crate::chart::parse_sheet_charts(parts, &path, &mut declined_parts)?;
         collect_tables(parts, &path, &sheet_rels, SheetId(idx as u32), &mut tables)?;
         sheets.push(sheet);
         shared_string_cells.push(indices);
+        cell_facts.push(facts);
         legacy_dimensions.push(legacy);
     }
 
+    if styles.cell_xfs.is_empty()
+        && sheets.iter().any(|sheet| {
+            sheet.row_styles.values().any(|&style| style == 0)
+                || sheet.col_styles.iter().any(|run| run.xf == 0)
+                || sheet.iter_cells().any(|(_, cell)| cell.style == Some(0))
+        })
+    {
+        styles.cell_xfs.push(xlsx_model::Xf::default());
+    }
     Ok(IndexedWorkbook {
         workbook: Workbook {
             sheets,
@@ -131,9 +152,11 @@ pub(crate) fn parse_workbook_indexed(
         },
         active_sheet: meta.active_sheet,
         shared_string_cells,
+        cell_facts,
         legacy_dimensions,
         legacy_styles,
         declined_parts,
+        rich_shared_strings,
     })
 }
 
@@ -198,12 +221,15 @@ fn parse_workbook_xml(data: &[u8]) -> Result<WorkbookMeta, ParseError> {
     let mut depth = 0;
     let mut date_system = DateSystem::V1900;
     let mut active_sheet = None;
+    let mut sheets_depth = None;
     let mut sheets = Vec::new();
     let mut defined_names = Vec::new();
 
     loop {
         match next_event(&mut reader, &mut buf, &mut depth)? {
             Event::Start(e) => match local_name(&e).as_slice() {
+                // the save rewrites the root's `sheets` child, so only it lists sheets
+                b"sheets" if depth == 2 => sheets_depth = Some(depth),
                 b"workbookPr" => {
                     if let Some(v) = attr(&e, b"date1904")?
                         && is_truthy(&v)
@@ -219,7 +245,7 @@ fn parse_workbook_xml(data: &[u8]) -> Result<WorkbookMeta, ParseError> {
                             .unwrap_or(SheetId(0)),
                     );
                 }
-                b"sheet" => {
+                b"sheet" if sheets_depth.is_some_and(|sheets| depth == sheets + 1) => {
                     let name = attr(&e, b"name")?.unwrap_or_default();
                     let rid = attr(&e, b"id")?;
                     sheets.push(SheetEntry { name, rid });
@@ -243,6 +269,12 @@ fn parse_workbook_xml(data: &[u8]) -> Result<WorkbookMeta, ParseError> {
                 }
                 _ => {}
             },
+            Event::End(e)
+                if e.name().local_name().as_ref() == b"sheets"
+                    && sheets_depth.is_some_and(|sheets| depth < sheets) =>
+            {
+                sheets_depth = None;
+            }
             Event::Eof => break,
             _ => {}
         }
@@ -445,12 +477,14 @@ fn relationship_part_path(path: &str) -> String {
     }
 }
 
-/// parse shared strings as plain model text while package capture retains runs.
-fn parse_shared_strings(data: &[u8]) -> Result<Vec<String>, ParseError> {
+/// parse shared strings as plain model text while package capture retains runs,
+/// noting which entries carried formatted runs.
+fn parse_shared_strings(data: &[u8]) -> Result<(Vec<String>, BTreeSet<usize>), ParseError> {
     let mut reader = reader(data);
     let mut buf = Vec::new();
     let mut depth = 0;
     let mut strings = Vec::new();
+    let mut rich = BTreeSet::new();
 
     loop {
         match next_event(&mut reader, &mut buf, &mut depth)? {
@@ -458,13 +492,53 @@ fn parse_shared_strings(data: &[u8]) -> Result<Vec<String>, ParseError> {
                 if strings.len() >= MAX_SHARED_STRINGS {
                     return Err(ParseError::TooManyStrings);
                 }
-                strings.push(collect_text(&mut reader, &mut buf, &mut depth)?);
+                let (text, runs) = collect_string_item(&mut reader, &mut buf, &mut depth)?;
+                if runs {
+                    rich.insert(strings.len());
+                }
+                strings.push(text);
             }
             Event::Eof => break,
             _ => {}
         }
     }
-    Ok(strings)
+    Ok((strings, rich))
+}
+
+/// [`collect_text`] over a string item (`<si>` or `<is>`), and whether it holds `<r>` runs.
+fn collect_string_item(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    buf: &mut Vec<u8>,
+    depth: &mut usize,
+) -> Result<(String, bool), ParseError> {
+    let target = *depth;
+    let mut out = String::new();
+    let mut runs = false;
+    loop {
+        match next_event(reader, buf, depth)? {
+            Event::Start(e) if *depth == target + 1 && local_name(&e) == b"r" => runs = true,
+            Event::Text(t) => out.push_str(&t.decode().map_err(xml_err)?),
+            Event::CData(t) => out.push_str(&t.decode().map_err(xml_err)?),
+            Event::GeneralRef(r) => {
+                let name = r.decode().map_err(xml_err)?;
+                out.push_str(&resolve_entity(&name)?);
+            }
+            Event::End(_) if *depth < target => break,
+            Event::Eof => return Err(ParseError::Malformed("unexpected eof in text".into())),
+            _ => {}
+        }
+    }
+    Ok((out, runs))
+}
+
+/// What a source worksheet's cells said that the model does not keep.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SourceCellFacts {
+    /// Formula cells written without a cached `<v>` result.
+    pub uncached_formulas: BTreeSet<(u32, u32)>,
+    /// Inline strings authored with formatted runs, with the text the model keeps.
+    pub rich_inline: BTreeMap<(u32, u32), String>,
 }
 
 /// in-progress cell state accumulated between a `<c>` start and its end.
@@ -475,6 +549,7 @@ struct CellBuild {
     style: Option<u32>,
     value_text: Option<String>,
     inline_text: Option<String>,
+    inline_runs: bool,
     formula: Option<String>,
 }
 
@@ -487,6 +562,7 @@ fn parse_worksheet(
     relationships: &BTreeMap<String, Relationship>,
     shared_string_cells: &mut SharedStringCells,
     legacy: &mut LegacySheetDimensions,
+    facts: &mut SourceCellFacts,
 ) -> Result<Sheet, ParseError> {
     let mut reader = reader(data);
     let mut buf = Vec::new();
@@ -497,6 +573,8 @@ fn parse_worksheet(
     let mut cur: Option<CellBuild> = None;
     let mut cell_count: u64 = 0;
     let mut hyperlink_count: usize = 0;
+    let mut row_style_count: usize = 0;
+    let mut columns = ColumnRuns::default();
     let mut shared_formulas = SharedFormulas::default();
 
     loop {
@@ -509,7 +587,19 @@ fn parse_worksheet(
                     };
                     cur_row = Some(row);
                     col_cursor = 0;
-                    let height = attr(&e, b"ht")?.and_then(|v| v.parse::<f64>().ok());
+                    if attr(&e, b"customFormat")?.is_some_and(|value| is_truthy(&value)) {
+                        let style = attr(&e, b"s")?
+                            .and_then(|value| value.parse::<u32>().ok())
+                            .unwrap_or(0);
+                        row_style_count += 1;
+                        if row_style_count > MAX_ROW_STYLES {
+                            return Err(ParseError::TooManyRowStyles);
+                        }
+                        sheet.row_styles.insert(row, style);
+                    }
+                    let height = attr(&e, b"ht")?
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .map(|h| h.min(MAX_ROW_HEIGHT_PT));
                     if let Some(height) = height {
                         legacy.row_heights.insert(row, height);
                     }
@@ -561,9 +651,10 @@ fn parse_worksheet(
                     }
                 }
                 b"is" => {
-                    let text = collect_text(&mut reader, &mut buf, &mut depth)?;
+                    let (text, runs) = collect_string_item(&mut reader, &mut buf, &mut depth)?;
                     if let Some(c) = cur.as_mut() {
                         c.inline_text = Some(text);
+                        c.inline_runs = runs;
                     }
                 }
                 b"mergeCell" => {
@@ -587,7 +678,7 @@ fn parse_worksheet(
                         sheet.hyperlinks.push(link);
                     }
                 }
-                b"col" => parse_col(&e, &mut sheet, legacy)?,
+                b"col" => parse_col(&e, &mut sheet, &mut columns, legacy)?,
                 b"sheetFormatPr" => {
                     sheet.format = SheetFormat {
                         default_row_height_pt: attr(&e, b"defaultRowHeight")?
@@ -606,7 +697,14 @@ fn parse_worksheet(
                 match name.local_name().as_ref() {
                     b"c" => {
                         if let Some(c) = cur.take() {
-                            finalize_cell(c, shared, &mut sheet, shared_string_cells)?;
+                            finalize_cell(
+                                c,
+                                shared,
+                                &mut sheet,
+                                &columns,
+                                shared_string_cells,
+                                facts,
+                            )?;
                         }
                         col_cursor += 1;
                     }
@@ -731,11 +829,13 @@ fn ranges_intersect(left: CellRange, right: CellRange) -> bool {
 /// sheet bounds). widths are stored per-column since the model has no
 /// column-range concept; the style keeps its run, which a whole-sheet `<col>`
 /// spans 16,384 columns wide. a negative authored width has no extent to
-/// render, so it narrows to zero the way a hidden column does; the authored
-/// value stays in `legacy` and the source span is reused verbatim on save.
+/// render, so it narrows to zero the way a hidden column does, and one past
+/// excel's ceiling opens at the ceiling; the authored value stays in `legacy`
+/// and the source span is reused verbatim on save.
 fn parse_col(
     e: &quick_xml::events::BytesStart,
     sheet: &mut Sheet,
+    columns: &mut ColumnRuns,
     legacy: &mut LegacySheetDimensions,
 ) -> Result<(), ParseError> {
     let hidden = attr(e, b"hidden")?.is_some_and(|value| is_truthy(&value));
@@ -756,21 +856,27 @@ fn parse_col(
         if sheet.col_styles.len() >= MAX_COL_STYLES {
             return Err(ParseError::TooManyColumnStyles);
         }
-        sheet.col_styles.push(ColStyle {
+        let run = ColStyle {
             first: min - 1,
             last: max - 1,
             xf,
-        });
+        };
+        sheet.col_styles.push(run);
+        columns.push(run);
     }
     let width = match authored {
         _ if hidden => 0.0,
-        Some(w) => w.max(0.0),
+        Some(w) => w.clamp(0.0, MAX_COL_WIDTH_CHARS),
         None => return Ok(()),
     };
     for col in min..=max {
         sheet.col_widths.insert(col - 1, width);
         if hidden && let Some(authored) = authored.filter(|authored| *authored > 0.0) {
-            sheet.hidden_col_widths.insert(col - 1, authored);
+            sheet
+                .hidden_col_widths
+                .insert(col - 1, authored.min(MAX_COL_WIDTH_CHARS));
+        } else {
+            sheet.hidden_col_widths.remove(&(col - 1));
         }
         if let Some(authored) = authored {
             legacy.col_widths.insert(col - 1, authored);
@@ -785,12 +891,23 @@ fn finalize_cell(
     c: CellBuild,
     shared: &[String],
     sheet: &mut Sheet,
+    columns: &ColumnRuns,
     shared_string_cells: &mut SharedStringCells,
+    facts: &mut SourceCellFacts,
 ) -> Result<(), ParseError> {
     let addr = match c.addr {
         Some(a) => a,
         None => return Ok(()),
     };
+    if c.formula.is_some() && c.value_text.is_none() && c.inline_text.is_none() {
+        facts.uncached_formulas.insert((addr.row, addr.col));
+    }
+    if c.inline_runs
+        && c.ty.as_deref() == Some("inlineStr")
+        && let Some(text) = &c.inline_text
+    {
+        facts.rich_inline.insert((addr.row, addr.col), text.clone());
+    }
     let value = match c.ty.as_deref() {
         Some("s") => {
             let idx = c
@@ -834,11 +951,18 @@ fn finalize_cell(
         },
     };
 
-    let cell = Cell {
+    let mut cell = Cell {
         value,
         formula: c.formula,
         style: c.style,
     };
+    if cell == Cell::default()
+        && sheet
+            .inherited_style_in(addr, columns)
+            .is_some_and(|style| style != 0)
+    {
+        cell.style = Some(0);
+    }
     if cell != Cell::default() {
         sheet.set_cell(addr, cell);
     }
@@ -860,7 +984,7 @@ fn error_from_str(s: &str) -> Option<ErrorValue> {
     })
 }
 
-fn is_truthy(v: &str) -> bool {
+pub(crate) fn is_truthy(v: &str) -> bool {
     matches!(v, "1" | "true" | "on")
 }
 
