@@ -1,6 +1,5 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use xlsx_model::{CellRange, CellRef, SheetId};
-use xlsx_ops::CapturedFormat;
 
 use xlsx_ops::{
     BorderLineStyle, BorderPreset, HorizontalAlignment, NumberFormatMutation, TextWrapping,
@@ -11,6 +10,9 @@ use xlsx_ops::{
 pub enum UpdateOrigin {
     Local,
     Remote,
+    /// Recalculation alone changed values; the shared document did not change, so `update`
+    /// is empty and is not for peers.
+    Recalculation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,12 +21,12 @@ pub struct UpdateEvent {
     pub origin: UpdateOrigin,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct CalculationOptions {
     pub now_serial: Option<f64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CellAddress {
     pub sheet: SheetId,
     pub cell: CellRef,
@@ -34,20 +36,6 @@ pub struct CellAddress {
 pub struct CellInput {
     pub cell: CellRef,
     pub input: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkbookCellInput {
-    pub sheet: SheetId,
-    pub cell: CellRef,
-    pub input: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct WorkbookFormatInput {
-    pub sheet: SheetId,
-    pub range: CellRange,
-    pub format: CapturedFormat,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,7 +64,7 @@ pub struct SheetInfo {
     pub initial_scroll_y: f32,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CalculationResult {
     pub changed: Vec<CellAddress>,
     pub cycle_cells: Vec<CellAddress>,

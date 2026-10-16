@@ -29,10 +29,11 @@ concurrency:
 jobs:
   prepare:
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       source-sha: ${{ steps.source.outputs.sha }}
+      runner-image: ${{ steps.runner.outputs.image }}
       formats: ${{ steps.plan.outputs.formats }}
       roundtrip-builds: ${{ steps.plan.outputs.roundtrip-builds }}
       roundtrip-shards: ${{ steps.plan.outputs.roundtrip-shards }}
@@ -59,6 +60,10 @@ jobs:
           remote_sha=$(git ls-remote --heads origin "refs/heads/$TARGET_BRANCH" | cut -f1)
           test "$source_sha" = "$remote_sha"
           echo "sha=$source_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Record the runner image
+        id: runner
+        run: echo "image=$ImageVersion" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
@@ -107,6 +112,15 @@ jobs:
       matrix:
         format: ${{ fromJSON(needs.prepare.outputs.formats) }}
     steps:
+      - name: Require the planned runner image
+        env:
+          PLANNED_IMAGE: ${{ needs.prepare.outputs.runner-image }}
+        run: |
+          if [ "$ImageVersion" != "$PLANNED_IMAGE" ]; then
+            echo "::error::Runner image $ImageVersion differs from the planned $PLANNED_IMAGE; re-run the failed jobs, or the whole run once that image is no longer served"
+            exit 1
+          fi
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           ref: ${{ needs.prepare.outputs.source-sha }}
@@ -129,7 +143,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: "1.3.14"
+          bun-version: "1.4.3"
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
@@ -154,6 +168,7 @@ jobs:
           tool: wasm-pack@0.15.0
 
       - name: Build the format renderer and install comparison tools
+        timeout-minutes: 30
         env:
           QUALITY_FORMAT: ${{ matrix.format }}
         run: |
@@ -262,7 +277,7 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         if: matrix.channel == 'commit'
         with:
-          bun-version: "1.3.14"
+          bun-version: "1.4.3"
 
       - name: Freeze the shared native font bundle
         if: matrix.channel == 'commit'
@@ -277,6 +292,54 @@ jobs:
           compression-level: 0
           retention-days: 7
 
+  docx-large-synthetic:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/docx-large-synthetic
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ inputs.branch }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: docx-large-synthetic
+          workspaces: . -> target/docx-large-synthetic
+
+      - name: Compile the synthetic DOCX benchmark
+        run: cargo test --locked --release -p betteroffice-docx-edit --test large_document_scaling --no-run --message-format=json > "${RUNNER_TEMP}/docx-large-synthetic-build.jsonl"
+
+      - name: Measure synthetic DOCX pagination and peak process memory
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import resource
+          import subprocess
+          from pathlib import Path
+
+          messages = (Path(os.environ['RUNNER_TEMP']) / 'docx-large-synthetic-build.jsonl').read_text().splitlines()
+          executables = [message['executable'] for line in messages
+                         if (message := json.loads(line)).get('reason') == 'compiler-artifact'
+                         and message['target']['name'] == 'large_document_scaling'
+                         and message.get('executable')]
+          if len(executables) != 1:
+              raise SystemExit('Expected one synthetic DOCX test executable')
+          result = subprocess.run([executables[0], '--ignored', '--nocapture'])
+          peak_rss_kib = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+          ceiling_kib = 2 * 1024 * 1024
+          print(f'peak_rss_kib={peak_rss_kib} ceiling_kib={ceiling_kib}', flush=True)
+          if result.returncode:
+              raise SystemExit(result.returncode)
+          if peak_rss_kib > ceiling_kib:
+              raise SystemExit('Synthetic DOCX process exceeded the 2 GiB memory ceiling')
+          PY
+
   docx-benchmark:
     needs: [prepare, native-build]
     if: contains(fromJSON(needs.prepare.outputs.formats), 'docx')
@@ -289,6 +352,15 @@ jobs:
       matrix:
         shard: ${{ fromJSON(needs.prepare.outputs.docx-shards) }}
     steps:
+      - name: Require the planned runner image
+        env:
+          PLANNED_IMAGE: ${{ needs.prepare.outputs.runner-image }}
+        run: |
+          if [ "$ImageVersion" != "$PLANNED_IMAGE" ]; then
+            echo "::error::Runner image $ImageVersion differs from the planned $PLANNED_IMAGE; re-run the failed jobs, or the whole run once that image is no longer served"
+            exit 1
+          fi
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           ref: ${{ needs.prepare.outputs.source-sha }}
@@ -323,6 +395,7 @@ jobs:
           python-version: "3.13"
 
       - name: Install LibreOffice and comparison tools
+        timeout-minutes: 15
         run: |
           bash scripts/office-quality/install-libreoffice.sh
           python -m pip install -r scripts/office-quality/requirements.txt
@@ -425,6 +498,15 @@ jobs:
       matrix:
         shard: ${{ fromJSON(needs.prepare.outputs.xlsx-shards) }}
     steps:
+      - name: Require the planned runner image
+        env:
+          PLANNED_IMAGE: ${{ needs.prepare.outputs.runner-image }}
+        run: |
+          if [ "$ImageVersion" != "$PLANNED_IMAGE" ]; then
+            echo "::error::Runner image $ImageVersion differs from the planned $PLANNED_IMAGE; re-run the failed jobs, or the whole run once that image is no longer served"
+            exit 1
+          fi
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           ref: ${{ needs.prepare.outputs.source-sha }}
@@ -448,6 +530,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install LibreOffice and comparison tools
+        timeout-minutes: 15
         run: |
           bash scripts/office-quality/install-libreoffice.sh
           python -m pip install -r scripts/office-quality/requirements.txt
@@ -529,6 +612,15 @@ jobs:
     env:
       SOFFICE: /opt/libreoffice26.2/program/soffice
     steps:
+      - name: Require the planned runner image
+        env:
+          PLANNED_IMAGE: ${{ needs.prepare.outputs.runner-image }}
+        run: |
+          if [ "$ImageVersion" != "$PLANNED_IMAGE" ]; then
+            echo "::error::Runner image $ImageVersion differs from the planned $PLANNED_IMAGE; re-run the failed jobs, or the whole run once that image is no longer served"
+            exit 1
+          fi
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           ref: ${{ needs.prepare.outputs.source-sha }}
@@ -553,8 +645,9 @@ jobs:
           python-version: "3.13"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: "1.3.14"
+          bun-version: "1.4.3"
       - name: Install LibreOffice and comparison tools
+        timeout-minutes: 15
         run: |
           bash scripts/office-quality/install-libreoffice.sh
           python -m pip install -r scripts/office-quality/requirements.txt
@@ -603,6 +696,15 @@ jobs:
       matrix:
         shard: ${{ fromJSON(needs.prepare.outputs.xlsx-fidelity-shards) }}
     steps:
+      - name: Require the planned runner image
+        env:
+          PLANNED_IMAGE: ${{ needs.prepare.outputs.runner-image }}
+        run: |
+          if [ "$ImageVersion" != "$PLANNED_IMAGE" ]; then
+            echo "::error::Runner image $ImageVersion differs from the planned $PLANNED_IMAGE; re-run the failed jobs, or the whole run once that image is no longer served"
+            exit 1
+          fi
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           ref: ${{ needs.prepare.outputs.source-sha }}
@@ -619,8 +721,9 @@ jobs:
           python-version: "3.13"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: "1.3.14"
+          bun-version: "1.4.3"
       - name: Install LibreOffice and comparison tools
+        timeout-minutes: 15
         run: |
           bash scripts/office-quality/install-libreoffice.sh
           python -m pip install -r scripts/office-quality/requirements.txt
@@ -707,6 +810,15 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.prepare.outputs.roundtrip-shards) }}
     steps:
+      - name: Require the planned runner image
+        env:
+          PLANNED_IMAGE: ${{ needs.prepare.outputs.runner-image }}
+        run: |
+          if [ "$ImageVersion" != "$PLANNED_IMAGE" ]; then
+            echo "::error::Runner image $ImageVersion differs from the planned $PLANNED_IMAGE; re-run the failed jobs, or the whole run once that image is no longer served"
+            exit 1
+          fi
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           ref: ${{ needs.prepare.outputs.source-sha }}
@@ -730,6 +842,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install the pinned LibreOffice release
+        timeout-minutes: 15
         run: bash scripts/office-quality/install-libreoffice.sh
       - name: Download the frozen originals
         env:
@@ -892,7 +1005,7 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         if: inputs.publish_renders && github.repository == 'openooxml/betteroffice'
         with:
-          bun-version: "1.3.14"
+          bun-version: "1.4.3"
 
       - name: Publish the reconciled commit renders
         if: inputs.publish_renders && github.repository == 'openooxml/betteroffice'

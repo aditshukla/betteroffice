@@ -1,7 +1,7 @@
 //! table-driven coverage for the function library: each case parses a formula,
 //! evaluates it against a shared in-memory workbook, and asserts the value.
 
-use xlsx_calc::{EvalContext, evaluate, parse_formula};
+use xlsx_calc::{EvalContext, evaluate, evaluate_array, parse_formula};
 use xlsx_model::{Cell, CellRef, CellValue, ErrorValue, Sheet, SheetId, Workbook};
 
 fn n(v: f64) -> CellValue {
@@ -270,6 +270,8 @@ fn math_functions() {
         ("ISOWEEKNUM(44200)", n(1.0)),
         ("ISOWEEKNUM(44196)", n(53.0)),
         ("ISOWEEKNUM(46286)", n(39.0)),
+        ("ISOWEEKNUM()", e(ErrorValue::Value)),
+        ("ISOWEEKNUM(46023, 2)", e(ErrorValue::Value)),
         ("WEEKNUM(46023, 21)", n(1.0)),
         ("WEEKNUM(44196, 21)", n(53.0)),
         ("WEEKNUM(46023)", n(1.0)),
@@ -468,6 +470,136 @@ fn text_functions() {
 }
 
 #[test]
+fn search_offsets_use_original_unicode_positions() {
+    check(&[
+        ("SEARCH(\"b\", \"İb\")", n(2.0)),
+        ("SEARCH(\"i\", \"İ\")", n(1.0)),
+        ("SEARCH(\"b\", \"aİb\", 2)", n(3.0)),
+        ("SEARCH(\"B\", \"İİb\")", n(3.0)),
+        ("SEARCH(\"İB\", \"xİİb\")", n(3.0)),
+        ("SEARCH(\"b\", \"bİb\", 2)", n(3.0)),
+        ("SEARCH(\"b\", \"İİb\", 3)", n(3.0)),
+        ("SEARCH(\"B\", \"éİb\")", n(3.0)),
+        ("SEARCH(\"B\", \"😀İb\", 2)", n(3.0)),
+        ("SEARCH(\"B\", \"i̇İb\")", n(4.0)),
+        ("FIND(\"b\", \"İİb\")", n(3.0)),
+        ("FIND(\"b\", \"aİb\", 2)", n(3.0)),
+        ("FIND(\"i\", \"İ\")", e(ErrorValue::Value)),
+        ("FIND(\"B\", \"İb\")", e(ErrorValue::Value)),
+    ]);
+}
+
+#[test]
+fn text_number_formats_are_width_free() {
+    check(&[
+        ("TEXT(12, \"_(€* #,##0_)\")", t(" €12 ")),
+        ("TEXT(12, \"0*x0\")", t("12")),
+        ("TEXT(1.2, \"??0.??\")", t("  1.2 ")),
+    ]);
+}
+
+#[test]
+fn text_formats_fraction_placeholders() {
+    check(&[
+        ("TEXT(2.75, \"# ?/?\")", t("2 3/4")),
+        ("TEXT(0.3, \"# ??/??\")", t("  3/10")),
+        ("TEXT(0.3, \"?/8\")", t("2/8")),
+    ]);
+}
+
+#[test]
+fn text_fixed_denominator_numerators_beyond_u64_show_general() {
+    check(&[("TEXT(1E18, \"?/32\")", t("1E+18"))]);
+}
+
+#[test]
+fn text_fraction_convergents_beyond_u64_show_general() {
+    check(&[("TEXT(1000000000000.75, \"?/?????????\")", t("1E+12"))]);
+}
+
+#[test]
+fn search_preserves_contextual_lowercasing() {
+    check(&[
+        ("SEARCH(\"ΟΣ\", \"ΟΣ\")", n(1.0)),
+        ("SEARCH(\"ος\", \"ΟΣ\")", n(1.0)),
+        ("SEARCH(\"ΟΣ\", \"ος\")", n(1.0)),
+        ("SEARCH(\"ΟΣ\", \"İ ΟΣ\")", n(3.0)),
+        ("SEARCH(\"ΟΣ\", \"İ ΟΣ\", 2)", n(3.0)),
+    ]);
+}
+
+#[test]
+fn search_handles_empty_text_and_invalid_starts() {
+    check(&[
+        ("SEARCH(\"\", \"İb\")", n(1.0)),
+        ("SEARCH(\"\", \"İb\", 2)", n(2.0)),
+        ("SEARCH(\"\", \"\")", n(1.0)),
+        ("SEARCH(\"b\", \"\")", e(ErrorValue::Value)),
+        ("SEARCH(\"z\", \"İb\")", e(ErrorValue::Value)),
+        ("SEARCH(\"b\", \"İb\", 0)", e(ErrorValue::Value)),
+        ("SEARCH(\"b\", \"İb\", -1)", e(ErrorValue::Value)),
+        ("SEARCH(\"\", \"İb\", 4)", e(ErrorValue::Value)),
+        ("SEARCH(\"b\", \"İb\", 1E100)", e(ErrorValue::Value)),
+    ]);
+}
+
+#[test]
+fn tilde_criteria_match_literal_text_across_if_functions() {
+    let mut wb = Workbook::default();
+    let mut sheet = Sheet::new("Sheet1");
+    for (row, (criterion, value)) in [
+        ("~a", 10.0),
+        ("~a", 20.0),
+        ("~a", 30.0),
+        ("a", 40.0),
+        ("~", 50.0),
+        ("~x", 60.0),
+        ("~~", 70.0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let row = row + 1;
+        for (column, value) in [("A", t(criterion)), ("B", n(value))] {
+            let address = format!("{column}{row}");
+            sheet.set_cell(
+                CellRef::parse_a1(&address).unwrap(),
+                Cell {
+                    value,
+                    ..Cell::default()
+                },
+            );
+        }
+    }
+    wb.sheets.push(sheet);
+
+    for (formula, expected) in [
+        ("COUNTIF(A1:A7,\"~a\")", n(3.0)),
+        ("COUNTIF(A1:A7,\"~\")", n(1.0)),
+        ("SUMIF(A1:A7,\"~a\",B1:B7)", n(60.0)),
+        ("SUMIF(A1:A7,\"~\",B1:B7)", n(50.0)),
+        ("AVERAGEIF(A1:A7,\"~a\",B1:B7)", n(20.0)),
+        ("AVERAGEIF(A1:A7,\"~\",B1:B7)", n(50.0)),
+        ("MAXIFS(B1:B7,A1:A7,\"~a\")", n(30.0)),
+        ("MAXIFS(B1:B7,A1:A7,\"~\")", n(50.0)),
+        ("MINIFS(B1:B7,A1:A7,\"~a\")", n(10.0)),
+        ("MINIFS(B1:B7,A1:A7,\"~\")", n(50.0)),
+        ("COUNTIF(A1:A7,\"~~\")", n(1.0)),
+        ("COUNTIF(A1:A7,\"=~A\")", n(3.0)),
+        ("COUNTIF(A1:A7,\"<>~a\")", n(4.0)),
+        ("COUNTIF(A1:A7,\"~~*\")", n(6.0)),
+        ("COUNTIF(A1:A7,\"*~\")", n(2.0)),
+        ("COUNTIFS(A1:A7,\"~a\",B1:B7,\">10\")", n(2.0)),
+        ("SUMIFS(B1:B7,A1:A7,\"~a\",B1:B7,\">10\")", n(50.0)),
+        ("AVERAGEIFS(B1:B7,A1:A7,\"~a\",B1:B7,\">10\")", n(25.0)),
+    ] {
+        let expr = parse_formula(formula).expect("parse");
+        let ctx = EvalContext::new(&wb, SheetId(0));
+        assert_eq!(evaluate(&expr, &ctx), expected, "{formula}");
+    }
+}
+
+#[test]
 fn datetime_functions() {
     check(&[
         ("DATE(2020, 1, 1)", n(43831.0)),
@@ -476,6 +608,26 @@ fn datetime_functions() {
         ("DATE(1900, 2, 29)", n(60.0)), // the phantom leap day
         ("DATE(1900, 3, 1)", n(61.0)),
         ("YEAR(43831)", n(2020.0)),
+        ("YEAR(2958465)", n(9999.0)),
+        ("DAY(2958465)", n(31.0)),
+        ("YEAR(2958466)", e(ErrorValue::Num)),
+        ("DAY(1E+300)", e(ErrorValue::Num)),
+        ("MONTH(1E+300)", e(ErrorValue::Num)),
+        ("YEAR(1E+300)", e(ErrorValue::Num)),
+        ("WEEKDAY(1E+300)", e(ErrorValue::Num)),
+        ("WEEKNUM(1E+300)", e(ErrorValue::Num)),
+        ("ISOWEEKNUM(1E+300)", e(ErrorValue::Num)),
+        ("DAY(-1E+300)", e(ErrorValue::Num)),
+        ("DATE(10000, 1, 1)", e(ErrorValue::Num)),
+        ("DATE(9999, 12, 31)", n(2958465.0)),
+        ("DATE(2020, 1, 1E+300)", e(ErrorValue::Num)),
+        ("EDATE(2958465, 1)", e(ErrorValue::Num)),
+        ("EDATE(1, 1E+300)", e(ErrorValue::Num)),
+        ("WORKDAY(1, 1E+300)", e(ErrorValue::Num)),
+        ("WORKDAY(1E+300, 1)", e(ErrorValue::Num)),
+        ("NETWORKDAYS(0, 1E+300)", e(ErrorValue::Num)),
+        ("DAYS(2958466, 1)", e(ErrorValue::Num)),
+        ("YEARFRAC(1, 2958466, 2)", e(ErrorValue::Num)),
         ("MONTH(43831)", n(1.0)),
         ("DAY(43831)", n(1.0)),
         ("DAY(60)", n(29.0)),
@@ -799,6 +951,31 @@ fn draws(src: &str, seed: Option<u64>, count: usize) -> Vec<f64> {
             other => panic!("formula {src:?}: expected number, got {other:?}"),
         })
         .collect()
+}
+
+#[test]
+fn randbetween_draws_use_the_shared_random_stream() {
+    let values = draws("RANDBETWEEN(1,1000000)", Some(42), 8);
+    assert!(
+        values
+            .iter()
+            .all(|value| (1.0..=1_000_000.0).contains(value))
+    );
+    assert!(values.iter().all(|value| value.fract() == 0.0));
+    assert!(values.windows(2).all(|pair| pair[0] != pair[1]));
+    assert_eq!(values, draws("RANDBETWEEN(1,1000000)", Some(42), 8));
+    assert_ne!(values, draws("RANDBETWEEN(1,1000000)", Some(43), 8));
+    let wb = fixture();
+    let mut ctx = EvalContext::new(&wb, SheetId(0));
+    ctx.rand_seed = Some(42);
+    assert_eq!(
+        evaluate(&parse_formula("RANDBETWEEN(1)").unwrap(), &ctx),
+        e(ErrorValue::Value)
+    );
+    check(&[
+        ("RANDBETWEEN(1)", e(ErrorValue::Value)),
+        ("RANDBETWEEN(1,1000000,1)", e(ErrorValue::Value)),
+    ]);
 }
 
 /// the rounding and error rules here were measured against Excel for Mac over
@@ -1305,4 +1482,88 @@ fn mixed_numbers_coerce() {
         // the clock reading the same helper does is untouched
         ("\"0:15\"+0", n(0.010416666666666666)),
     ]);
+}
+
+/// every name the two dispatch tables spell, read from the tables themselves
+/// so a new builtin is swept without listing it here.
+fn builtin_names() -> Vec<&'static str> {
+    let tables = [
+        include_str!("../src/functions/mod.rs"),
+        include_str!("../src/array.rs"),
+    ];
+    let mut names: Vec<&str> = tables
+        .iter()
+        .flat_map(|src| src.lines())
+        .filter(|line| line.contains("=> "))
+        .flat_map(|line| line.split('"').skip(1).step_by(2))
+        .filter(|name| {
+            name.starts_with(|c: char| c.is_ascii_uppercase())
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '.')
+        })
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// a stored formula can call any builtin with any argument list; a wrong count,
+/// type or magnitude is an error value, never a panic.
+#[test]
+fn every_builtin_survives_any_argument_list() {
+    const SHAPES: &[&str] = &[
+        "",
+        "1",
+        "1,2",
+        "1,2,3",
+        "1,2,3,4",
+        "1,2,3,4,5",
+        "1,2,3,4,5,6",
+        "1,2,3,4,5,6,7",
+        ",",
+        ",,",
+        "\"a\"",
+        "\"\",\"\"",
+        "-1",
+        "0,0",
+        "#N/A",
+        "TRUE,FALSE,0",
+        "A1:C3",
+        "A1:C3,1",
+        "A1:C3,1,1",
+        "A1:A3,B1:B3",
+        "{1,2;3,4}",
+        "1E+300",
+        "-1E+300",
+        "1E+300,1",
+        "1,1E+300",
+        "1,1,1E+300",
+        "1,1,1,1E+300",
+        "0,1E+300",
+        "1,-1E+300",
+    ];
+    let names = builtin_names();
+    for name in ["ISOWEEKNUM", "SEQUENCE", "LAMBDA", "WORKDAY.INTL"] {
+        assert!(names.contains(&name), "{name} missing from the sweep");
+    }
+    let wb = fixture();
+    let ctx = EvalContext::new(&wb, SheetId(0));
+    let mut panicked = Vec::new();
+    for name in &names {
+        for shape in SHAPES {
+            let src = format!("{name}({shape})");
+            let Ok(expr) = parse_formula(&src) else {
+                continue;
+            };
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                evaluate(&expr, &ctx);
+                evaluate_array(&expr, &ctx);
+            }));
+            if run.is_err() {
+                panicked.push(src);
+            }
+        }
+    }
+    assert!(panicked.is_empty(), "panicked: {panicked:?}");
 }

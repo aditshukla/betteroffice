@@ -20,6 +20,8 @@ export interface TextStyleSnapshot {
   underline: string | null;
   spacingPt?: number | null;
   baselinePct?: number | null;
+  /** `a:rPr@kern`: the smallest size, in points, the run is kerned at. */
+  kernPt?: number | null;
   /** `a:rPr@cap`: how the run is cased when drawn, never in the stored text. */
   caps?: 'none' | 'small' | 'all' | null;
 }
@@ -53,6 +55,15 @@ export interface PptxTextSearchOptions {
   limit?: number;
 }
 
+/**
+ * A caret position in a story that later edits, undo, redo and remote updates
+ * move along with the text. Plain data; `position` is opaque.
+ */
+export interface PptxCaretAnchor {
+  storyId: string;
+  position: string;
+}
+
 /** Zero-based slide index; story-local UTF-16 offsets. */
 export interface PptxTextMatch {
   slideIndex: number;
@@ -72,19 +83,41 @@ export interface ColorValue {
   themeTint?: string;
   themeShade?: string;
   auto?: boolean;
+  luminanceModulation?: number;
+  luminanceOffset?: number;
+  saturationModulation?: number;
+  alpha?: number;
 }
 
+export interface ShapeGradient {
+  type: string;
+  angle?: number;
+  stops: Array<{ position: number; color: ColorValue }>;
+}
+
+/** An authored fill as the deck stores it. */
 export interface ShapeFill {
   type: string;
   color?: ColorValue;
+  gradient?: ShapeGradient;
 }
 
+export interface ShapeLineEnd {
+  type: string;
+  width: string | null;
+  length: string | null;
+}
+
+/** An authored outline as the deck stores it; `width` is EMU. */
 export interface ShapeOutline {
   width?: number;
   color?: ColorValue;
+  gradient?: ShapeGradient;
   style?: string;
   cap?: string;
   join?: string;
+  headEnd?: ShapeLineEnd;
+  tailEnd?: ShapeLineEnd;
 }
 
 export type BlipEffect =
@@ -383,7 +416,7 @@ export interface ShapePrimitive extends PrimitiveBase {
   name: string;
   geometry: string;
   path: GeometryPathCommand[];
-  /** An unsupported outline or clip was replaced by a rectangle. */
+  /** A rectangle substitutes for the authored outline or clip. */
   geometryFallback?: boolean;
   clip?: GeometryPathCommand[];
   evenOdd?: boolean;
@@ -420,7 +453,7 @@ export interface ImagePrimitive extends PrimitiveBase {
   tile?: { scaleX: number; scaleY: number };
   /** Outline the picture is masked to, when its `spPr` gives it one. */
   path?: GeometryPathCommand[];
-  /** The authored mask is unsupported and uses a rectangle fallback. */
+  /** A rectangle substitutes for the authored mask. */
   geometryFallback?: boolean;
   stroke?: Stroke;
   shadow?: Shadow;
@@ -540,4 +573,10 @@ export type HitTestResult =
 export interface UpdateEvent {
   origin: 'local' | 'remote';
   update: Uint8Array;
+}
+
+export interface TextParagraphDraft {
+  bullet?: boolean;
+  alignment?: ParagraphAlignment | null;
+  runs: Array<{ text: string; style?: TextStyle }>;
 }

@@ -1064,6 +1064,25 @@ fn xlookup_honours_match_and_search_modes() {
     );
 }
 
+#[test]
+fn wildcard_lookups_match_literal_tildes() {
+    let mut workbook = fixture();
+    for (index, text) in ["a", "~a", "~", "~~"].iter().enumerate() {
+        put(&mut workbook.sheets[0], &format!("A{}", index + 1), t(text));
+    }
+    for (formula, expected) in [
+        (r#"XMATCH("~a",A1:A4,2)"#, n(2.0)),
+        (r#"XMATCH("~",A1:A4,2)"#, n(3.0)),
+        (r#"XMATCH("~~",A1:A4,2)"#, n(3.0)),
+        (r#"XMATCH("*~",A1:A4,2,-1)"#, n(4.0)),
+        (r#"XLOOKUP("~a",A1:A4,B1:B4,,2)"#, n(1.0)),
+        (r#"XLOOKUP("~",A1:A4,B1:B4,,2)"#, n(4.0)),
+        (r#"XLOOKUP("~~",A1:A4,B1:B4,,2)"#, n(4.0)),
+    ] {
+        assert_eq!(values(formula, &workbook), vec![expected], "{formula}");
+    }
+}
+
 /// a text builtin with no array-aware form still answers once per element.
 #[test]
 fn text_builtins_lift_over_a_range() {
@@ -1093,18 +1112,30 @@ fn reading_a_bound_block_charges_the_budget() {
         &format!("_xlfn.LET(_xlpm.x,_xlfn.SEQUENCE(60000),{body})"),
         &workbook,
     );
-    assert_eq!(large.len(), 400);
-    assert!(large.iter().any(|value| matches!(
-        value,
-        CellValue::Error {
+    assert_eq!(
+        large,
+        vec![CellValue::Error {
             value: ErrorValue::Num
-        }
-    )));
+        }]
+    );
     let small = values(
         &format!("_xlfn.LET(_xlpm.x,_xlfn.SEQUENCE(4),{body})"),
         &workbook,
     );
     assert!(small.iter().all(|value| *value == n(4.0)));
+}
+
+/// `MAKEARRAY` pays for its cells once, so a block the budget covers is built.
+#[test]
+fn makearray_charges_its_cells_once() {
+    let workbook = fixture();
+    assert_eq!(
+        values(
+            "SUM(_xlfn.MAKEARRAY(600000,1,_xlfn.LAMBDA(_xlpm.r,_xlpm.c,_xlpm.r)))",
+            &workbook
+        ),
+        vec![n(180_000_300_000.0)]
+    );
 }
 
 /// `LINEST` lays its coefficients out right to left with the intercept last,
