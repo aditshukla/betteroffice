@@ -125,6 +125,61 @@ mod pattern_tests {
     }
 
     #[test]
+    fn hyperlink_streaming_resumes_when_byte_budget_increases() {
+        let mut model = WorkbookModel::default();
+        model.sheets.push(Sheet::new("Data"));
+        let authority = WorkbookAuthority::from_model_with_client_id(&model, 272).unwrap();
+        let map = {
+            let txn = authority.doc.transact();
+            txn.get_map(SHEETS)
+                .unwrap()
+                .get(&txn, "sheet:0")
+                .unwrap()
+                .cast::<MapRef>()
+                .unwrap()
+        };
+        let mut keys = SnapshotKeys::new();
+        for (range, target) in [("A1", "https://example.com".into()), ("B1", "x".repeat(512))] {
+            let mut link = hyperlinks::hyperlink_metadata(CellRange::parse_a1(range).unwrap());
+            link.external_target = Some(target);
+            let json = serde_json::to_string(&link).unwrap();
+            assert_eq!(json.len() <= 256, range == "A1");
+            let key = format!("hyperlink:{range}");
+            map.try_update(&mut authority.doc.transact_mut(), key.as_str(), json);
+            keys.insert((parent(&map), Arc::from(key)));
+        }
+        let mut projected = authority.strict_materialize().unwrap().0;
+        let mut validation = SnapshotValidation {
+            phase: 2,
+            version: SCHEMA_VERSION,
+            ..Default::default()
+        };
+        validation.maps.insert(parent(&map), (0, "sheet"));
+        validation.sheet_keys.insert(0, Arc::from("sheet:0"));
+        validation
+            .advance(
+                &authority,
+                &mut projected,
+                &mut keys,
+                SnapshotBudget::new(1, 768).unwrap(),
+            )
+            .unwrap();
+        assert!(validation.hyperlink_value.bytes() > 0);
+        assert_eq!(keys.len(), 2);
+        let budget = SnapshotBudget::new(1, 4096).unwrap();
+        let mut steps = 0;
+        while validation.phase != 3 {
+            validation
+                .advance(&authority, &mut projected, &mut keys, budget)
+                .unwrap();
+            steps += 1;
+            assert!(steps < 1000);
+        }
+        assert_eq!(validation.hyperlink_value.bytes(), 0);
+        validate_for_test(&authority, projected).unwrap();
+    }
+
+    #[test]
     fn oversized_hyperlink_values_are_refused_before_parsing() {
         let mut model = WorkbookModel::default();
         model.sheets.push(Sheet::new("Data"));
@@ -686,9 +741,10 @@ impl SnapshotValidation {
             .max_bytes()
             .saturating_sub(self.unit_bytes + 512)
             .min(4096);
-        let inline = json.is_some_and(|json| {
-            json.len() <= 256 && self.unit_bytes + 512 + json.len() * 8 <= budget.max_bytes()
-        });
+        let inline = self.hyperlink_value.bytes() == 0
+            && json.is_some_and(|json| {
+                json.len() <= 256 && self.unit_bytes + 512 + json.len() * 8 <= budget.max_bytes()
+            });
         let bytes = match json {
             Some(json) if inline => 512 + json.len() * 8,
             Some(_) => 640.max(512 + limit),
@@ -716,13 +772,13 @@ impl SnapshotValidation {
             }
             *edits.get_mut(&key[HYPERLINK_PREFIX.len()..]).unwrap() =
                 Some(hyperlinks::hyperlink_metadata(range));
-            self.hyperlink_value = hyperlinks::HyperlinkJson::default();
         } else {
             insert_hyperlink_edit(edits, key, value).map_err(SnapshotError::new)?;
             if let Some(Some(link)) = edits.get_mut(&key[HYPERLINK_PREFIX.len()..]) {
                 *link = hyperlinks::hyperlink_metadata(link.range);
             }
         }
+        self.hyperlink_value = hyperlinks::HyperlinkJson::default();
         Ok(true)
     }
 
