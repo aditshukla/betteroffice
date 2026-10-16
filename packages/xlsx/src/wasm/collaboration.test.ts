@@ -456,6 +456,26 @@ describe('wasm collaboration', () => {
     }
   });
 
+  it('accepts collaborative merges and unmerges and refuses invalid ranges atomically', () => {
+    const handle = collaborative(6007);
+    const range = { start: { row: 49, col: 0 }, end: { row: 50, col: 1 } };
+    try {
+      for (const type of ['mergeCells', 'unmergeCells'] as const) {
+        expect(handle.applyOps([{ type, sheet: 0, range }]).applied).toBe(true);
+        const expected = type === 'mergeCells' ? [range] : [];
+        expect(handle.mergedRanges(0, 'A50:B51')).toEqual(expected);
+        const state = handle.encodeStateAsUpdate();
+        expect(() => handle.applyOps([{ type, sheet: 0,
+          range: { start: { row: 1_048_576, col: 0 }, end: { row: 1_048_576, col: 1 } },
+        }])).toThrow();
+        expect(handle.encodeStateAsUpdate()).toEqual(state);
+        expect(handle.mergedRanges(0, 'A50:B51')).toEqual(expected);
+      }
+    } finally {
+      handle.dispose();
+    }
+  });
+
   it('drags a chart in a collaborative session and converges the peer', () => {
     const source = collaborativeCharts(6101);
     const target = collaborativeCharts(6102);

@@ -34,9 +34,13 @@ use yrs::{
 mod cascade_composition_tests;
 #[cfg(test)]
 mod fingerprint_composition_tests;
+mod merges;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod snapshot;
 pub(crate) mod snapshot_validation;
+use merges::{
+    MERGE_PREFIX, MergeEdits, MergeProjection, clear_merge_edits, insert_merge_edit, project_merges,
+};
 
 const META: &str = "xlsx";
 const CELL_FORMATS: &str = "xlsx:cell-formats";
@@ -49,8 +53,7 @@ const MIN_SUPPORTED_SCHEMA_VERSION: i64 = 3;
 const FREEZE_PANE_SCHEMA_VERSION: i64 = 4;
 const HYPERLINK_SCHEMA_VERSION: i64 = 5;
 const CHARTS_SCHEMA_VERSION: i64 = 6;
-const MERGE_EDITS_SCHEMA_VERSION: i64 = 7;
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 6;
 const BASE_FINGERPRINT: &str = "baseFingerprint";
 const STRUCTURE_GENERATION: &str = "structureGeneration";
 const CHARTS: &str = "charts";
@@ -61,7 +64,6 @@ const ROW_STYLES: &str = "rowStyles";
 const FREEZE_PANE: &str = "freezePane";
 const HYPERLINKS: &str = "hyperlinks";
 const MERGES: &str = "merges";
-const MERGE_EDITS: &str = "mergeEdits";
 const NAME: &str = "name";
 const ROW_HEIGHTS: &str = "rowHeights";
 const STYLES: &str = "styles";
@@ -594,7 +596,6 @@ struct SheetSharedTypes {
     contents: BranchID,
     row_heights: BranchID,
     styles: BranchID,
-    merge_edits: Option<BranchID>,
 }
 
 /// What a replica can do with an update offered as its whole state.
@@ -1004,6 +1005,7 @@ impl WorkbookAuthority {
     }
 
     /// Applies `ops`, whose style indices index `styles`, the caller's style table.
+    #[cfg(test)]
     pub(crate) fn apply_ops(
         &mut self,
         ops: &[Op],
@@ -1019,6 +1021,17 @@ impl WorkbookAuthority {
         origin: SyncOrigin,
         styles: &Stylesheet,
         encode_update: bool,
+    ) -> Result<Option<Vec<u8>>, AuthorityError> {
+        self.apply_ops_with_merge_edits(ops, origin, styles, encode_update, false)
+    }
+
+    fn apply_ops_with_merge_edits(
+        &mut self,
+        ops: &[Op],
+        origin: SyncOrigin,
+        styles: &Stylesheet,
+        encode_update: bool,
+        collaborative: bool,
     ) -> Result<Option<Vec<u8>>, AuthorityError> {
         let state_vector = encode_update.then(|| self.doc.transact().state_vector());
         if let Some(prepared) = self.prepare_set_cell_sync(ops, styles)
@@ -1085,8 +1098,15 @@ impl WorkbookAuthority {
         if self.base.tables != model.tables {
             Arc::make_mut(&mut self.base).tables = model.tables.clone();
         }
-        self.sync_model(&model, ops, origin, &authored_styles, &before_merges)
-            .map_err(AuthorityError::InvalidState)?;
+        self.sync_model(
+            &model,
+            ops,
+            origin,
+            &authored_styles,
+            &before_merges,
+            collaborative,
+        )
+        .map_err(AuthorityError::InvalidState)?;
         if let [Op::SetCell { at, cell, .. }] = ops
             && at.row < MAX_ROWS
             && at.col < MAX_COLS
@@ -1541,6 +1561,7 @@ impl WorkbookAuthority {
             styles,
             &self.encode_state_as_update_v1(),
             self.projection_valid.load(Ordering::Relaxed),
+            true,
         )
     }
 
@@ -1552,7 +1573,33 @@ impl WorkbookAuthority {
         styles: &Stylesheet,
         baseline: &[u8],
     ) -> Result<StagedLocalUpdate, AuthorityError> {
-        self.stage_local_ops_from_validated_v1(ops, origin, styles, baseline, false)
+        self.stage_local_ops_from_validated_v1(ops, origin, styles, baseline, false, true)
+    }
+
+    pub(crate) fn stage_standalone_ops_v1(
+        &self,
+        ops: &[Op],
+        origin: SyncOrigin,
+        styles: &Stylesheet,
+        baseline: Option<&[u8]>,
+    ) -> Result<StagedLocalUpdate, AuthorityError> {
+        let projection_valid = baseline.is_none() && self.projection_valid.load(Ordering::Relaxed);
+        let encoded;
+        let baseline = match baseline {
+            Some(baseline) => baseline,
+            None => {
+                encoded = self.encode_state_as_update_v1();
+                &encoded
+            }
+        };
+        self.stage_local_ops_from_validated_v1(
+            ops,
+            origin,
+            styles,
+            baseline,
+            projection_valid,
+            false,
+        )
     }
 
     fn stage_local_ops_from_validated_v1(
@@ -1562,6 +1609,7 @@ impl WorkbookAuthority {
         styles: &Stylesheet,
         baseline: &[u8],
         projection_valid: bool,
+        collaborative: bool,
     ) -> Result<StagedLocalUpdate, AuthorityError> {
         let staged_doc = Doc::with_client_id(self.client_id());
         hydrate_local_doc(&staged_doc, baseline).map_err(AuthorityError::InvalidState)?;
@@ -1572,7 +1620,7 @@ impl WorkbookAuthority {
         // `apply_ops` already encoded the same diff: the staged doc is the
         // hydrated baseline, so its pre-op state vector is this replica's own.
         let update = staged
-            .apply_ops(ops, origin, styles)?
+            .apply_ops_with_merge_edits(ops, origin, styles, true, collaborative)?
             .unwrap_or_else(|| Update::EMPTY_V1.to_vec());
         let state = staged.encode_state_as_update_v1();
         let state_vector_entries = staged.doc.transact().state_vector().len();
@@ -1888,9 +1936,6 @@ impl WorkbookAuthority {
             if version < CHARTS_SCHEMA_VERSION {
                 sheet.try_update(&mut txn, CHARTS, charts);
             }
-            if version < MERGE_EDITS_SCHEMA_VERSION {
-                let _: MapRef = sheet.get_or_init(&mut txn, MERGE_EDITS);
-            }
         }
         let meta = txn
             .get_map(META)
@@ -1998,7 +2043,7 @@ impl WorkbookAuthority {
                 .and_then(|value| value.cast::<MapRef>().ok())
                 .ok_or_else(|| format!("missing sheet {key}"))?;
             if strict {
-                require_map_keys_with_optional(
+                require_sheet_keys(
                     &sheet_map,
                     &txn,
                     expected_sheet_keys,
@@ -2064,7 +2109,7 @@ impl WorkbookAuthority {
                 .and_then(|value| value.cast::<MapRef>().ok())
                 .ok_or_else(|| format!("sheet {key} is not a map"))?;
             if strict && !active.contains(&key) {
-                require_map_keys_with_optional(
+                require_sheet_keys(
                     &sheet_map,
                     &txn,
                     expected_sheet_keys,
@@ -2125,6 +2170,7 @@ impl WorkbookAuthority {
         origin: SyncOrigin,
         authored_styles: &HashMap<(u32, CellRef), Option<u32>>,
         before_merges: &[Vec<CellRange>],
+        collaborative: bool,
     ) -> Result<(), String> {
         let current_keys = self.current_sheet_keys()?;
         let (keys, history) =
@@ -2145,7 +2191,12 @@ impl WorkbookAuthority {
                     .any(|op| matches!(op, Op::MergeCells { .. } | Op::UnmergeCells { .. })));
         let structure_delta = i64::try_from(
             ops.iter()
-                .filter(|op| is_structural_op(op) && !is_collaborative_local_layout_op(op))
+                .filter(|op| {
+                    is_structural_op(op)
+                        && (!is_collaborative_local_layout_op(op)
+                            || (!collaborative
+                                && matches!(op, Op::MergeCells { .. } | Op::UnmergeCells { .. })))
+                })
                 .count(),
         )
         .map_err(|_| "too many structural operations".to_string())?;
@@ -2317,6 +2368,11 @@ impl WorkbookAuthority {
             for key in merges {
                 let (sheet_map, sheet_model) =
                     sheet_parts_by_key(&sheets, &txn, &keys, model, &key)?;
+                if !collaborative {
+                    sheet_map.try_update(&mut txn, MERGES, merges_to_any(&sheet_model.merges));
+                    clear_merge_edits(&sheet_map, &mut txn);
+                    continue;
+                }
                 let index = keys
                     .iter()
                     .position(|candidate| candidate == &key)
@@ -2324,19 +2380,45 @@ impl WorkbookAuthority {
                 let previous = before_merges
                     .get(index)
                     .ok_or_else(|| format!("sheet {key} has no prior merge state"))?;
-                let edits: MapRef = sheet_map.get_or_init(&mut txn, MERGE_EDITS);
+
+                let Some(Out::Any(baseline)) = sheet_map.get(&txn, MERGES) else {
+                    return Err(format!("sheet {key} is missing merges"));
+                };
+                let baseline_keys = merges_from_any(&baseline)?
+                    .iter()
+                    .map(CellRange::to_a1)
+                    .collect::<BTreeSet<_>>();
+                let previous_keys = previous
+                    .iter()
+                    .map(CellRange::to_a1)
+                    .collect::<BTreeSet<_>>();
+                let current_keys = sheet_model
+                    .merges
+                    .iter()
+                    .map(CellRange::to_a1)
+                    .collect::<BTreeSet<_>>();
                 for range in previous
                     .iter()
-                    .filter(|range| !sheet_model.merges.contains(range))
+                    .filter(|range| !current_keys.contains(&range.to_a1()))
                 {
-                    edits.try_update(&mut txn, range.to_a1(), false);
+                    let range_key = range.to_a1();
+                    let edit_key = format!("{MERGE_PREFIX}{range_key}");
+                    if baseline_keys.contains(&range_key) {
+                        sheet_map.try_update(&mut txn, edit_key, false);
+                    } else {
+                        sheet_map.remove(&mut txn, &edit_key);
+                    }
                 }
                 for range in sheet_model
                     .merges
                     .iter()
-                    .filter(|range| !previous.contains(range))
+                    .filter(|range| !previous_keys.contains(&range.to_a1()))
                 {
-                    edits.try_update(&mut txn, range.to_a1(), true);
+                    sheet_map.try_update(
+                        &mut txn,
+                        format!("{MERGE_PREFIX}{}", range.to_a1()),
+                        true,
+                    );
                 }
             }
         }
@@ -3586,14 +3668,7 @@ fn sync_sheet_with_style_key(
         .map_err(|error| format!("cannot encode sheet charts: {error}"))?;
     sheet_map.try_update(txn, CHARTS, charts);
     sheet_map.try_update(txn, MERGES, merges_to_any(&sheet.merges));
-    let merge_edits: MapRef = sheet_map.get_or_init(txn, MERGE_EDITS);
-    for key in merge_edits
-        .keys(txn)
-        .map(str::to_string)
-        .collect::<Vec<_>>()
-    {
-        merge_edits.remove(txn, &key);
-    }
+    clear_merge_edits(sheet_map, txn);
     sheet_map.try_update(txn, NAME, sheet.name.as_str());
     let row_heights: MapRef = sheet_map.get_or_init(txn, ROW_HEIGHTS);
     let styles: MapRef = sheet_map.get_or_init(txn, STYLES);
@@ -4191,15 +4266,7 @@ fn materialize_sheet<T: ReadTxn>(
         Some(Out::Any(value)) => merges_from_any(&value)?,
         _ => return Err("sheet is missing merges".to_string()),
     };
-    sheet.merges = if version >= MERGE_EDITS_SCHEMA_VERSION {
-        project_merges(
-            baseline_merges,
-            &nested_map(sheet_map, txn, MERGE_EDITS)?,
-            txn,
-        )?
-    } else {
-        baseline_merges
-    };
+    sheet.merges = project_merges(baseline_merges, sheet_map, txn)?;
     Ok(sheet)
 }
 
@@ -4245,10 +4312,6 @@ fn sheet_shared_types<T: ReadTxn>(sheet_map: &MapRef, txn: &T) -> Result<SheetSh
         contents: nested_map(sheet_map, txn, CONTENTS)?.as_ref().id(),
         row_heights: nested_map(sheet_map, txn, ROW_HEIGHTS)?.as_ref().id(),
         styles: nested_map(sheet_map, txn, STYLES)?.as_ref().id(),
-        merge_edits: sheet_map
-            .get(txn, MERGE_EDITS)
-            .and_then(|value| value.cast::<MapRef>().ok())
-            .map(|map| map.as_ref().id()),
     })
 }
 
@@ -4343,23 +4406,11 @@ fn sheet_schema_keys(version: i64) -> &'static [&'static str] {
         ROW_HEIGHTS,
         STYLES,
     ];
-    const V7: &[&str] = &[
-        COL_WIDTHS,
-        CONTENTS,
-        FREEZE_PANE,
-        HYPERLINKS,
-        MERGES,
-        MERGE_EDITS,
-        NAME,
-        ROW_HEIGHTS,
-        STYLES,
-    ];
     match version {
         MIN_SUPPORTED_SCHEMA_VERSION => V3,
         FREEZE_PANE_SCHEMA_VERSION => V4,
         HYPERLINK_SCHEMA_VERSION => V5,
-        CHARTS_SCHEMA_VERSION => V6,
-        _ => V7,
+        _ => V6,
     }
 }
 
@@ -4430,6 +4481,27 @@ fn require_map_keys_with_optional<T: ReadTxn>(
     } else {
         Err(format!("{label} keys do not match the schema"))
     }
+}
+
+fn require_sheet_keys<T: ReadTxn>(
+    map: &MapRef,
+    txn: &T,
+    expected: &[&str],
+    optional: &[&str],
+    label: &str,
+) -> Result<(), String> {
+    if expected.iter().any(|key| map.get(txn, key).is_none()) {
+        return Err(format!("{label} keys do not match the schema"));
+    }
+    let mut edits = MergeEdits::new();
+    for (key, value) in map.iter(txn) {
+        if key.starts_with(MERGE_PREFIX) {
+            insert_merge_edit(&mut edits, key, &value)?;
+        } else if !expected.contains(&key) && !optional.contains(&key) {
+            return Err(format!("{label} keys do not match the schema"));
+        }
+    }
+    Ok(())
 }
 
 fn cell_key(at: CellRef) -> String {
@@ -4670,50 +4742,6 @@ fn merges_from_any(value: &Any) -> Result<Vec<CellRange>, String> {
             })
         })
         .collect()
-}
-
-fn project_merges<T: ReadTxn>(
-    baseline: Vec<CellRange>,
-    edits: &MapRef,
-    txn: &T,
-) -> Result<Vec<CellRange>, String> {
-    let baseline_keys = baseline.iter().map(CellRange::to_a1).collect::<Vec<_>>();
-    let mut ranges = baseline
-        .into_iter()
-        .map(|range| (range.to_a1(), range))
-        .collect::<BTreeMap<_, _>>();
-    for (key, value) in edits.iter(txn) {
-        let range =
-            CellRange::parse_a1(key).map_err(|_| format!("invalid merge edit key {key}"))?;
-        if range.to_a1() != key {
-            return Err(format!("noncanonical merge edit key {key}"));
-        }
-        let present = value
-            .cast::<bool>()
-            .map_err(|_| format!("merge edit {key} is not a boolean"))?;
-        if present {
-            ranges.insert(key.to_string(), range);
-        } else {
-            ranges.remove(key);
-        }
-    }
-    let mut ordered = Vec::with_capacity(ranges.len());
-    for key in baseline_keys {
-        if let Some(range) = ranges.remove(&key) {
-            ordered.push(range);
-        }
-    }
-    ordered.extend(ranges.into_values());
-    let mut projected = Vec::with_capacity(ordered.len());
-    for range in ordered {
-        if projected
-            .iter()
-            .all(|chosen: &CellRange| !chosen.overlaps(&range))
-        {
-            projected.push(range);
-        }
-    }
-    Ok(projected)
 }
 
 fn any_u32(value: &Any, label: &str) -> Result<u32, String> {
@@ -6031,6 +6059,7 @@ impl WorkbookAuthority {
             .map(str::to_string)
             .collect::<BTreeSet<_>>();
         let mut shared_types = BTreeMap::new();
+        let mut baseline_merges = BTreeMap::new();
         for key in all_keys {
             let sheet_map = sheets
                 .get(&txn, &key)
@@ -6053,6 +6082,10 @@ impl WorkbookAuthority {
                     SheetFallbacks::default(),
                 )?;
             }
+            let Some(Out::Any(baseline)) = sheet_map.get(&txn, MERGES) else {
+                return Err(format!("sheet {key} is missing merges"));
+            };
+            baseline_merges.insert(key.clone(), merges_from_any(&baseline)?);
             shared_types.insert(key, sheet_shared_types(&sheet_map, &txn)?);
         }
         let structure = WorkbookStructure {
@@ -6079,6 +6112,7 @@ impl WorkbookAuthority {
                 .iter()
                 .map(|sheet| sheet.merges.clone())
                 .collect(),
+            baseline_merges,
             shared_types,
         };
         self.projection_valid.store(true, Ordering::Relaxed);
@@ -6220,8 +6254,7 @@ fn fingerprint_model_with_row_styles_oracle(
         3 => b"betteroffice-xlsx-yrs-v3".as_slice(),
         4 => b"betteroffice-xlsx-yrs-v4".as_slice(),
         5 => b"betteroffice-xlsx-yrs-v5".as_slice(),
-        6 => b"betteroffice-xlsx-yrs-v6".as_slice(),
-        _ => b"betteroffice-xlsx-yrs-v7".as_slice(),
+        _ => b"betteroffice-xlsx-yrs-v6".as_slice(),
     };
     fingerprint_model_with_row_domain_oracle(
         model,
@@ -7319,9 +7352,6 @@ mod tests {
                 if version < FREEZE_PANE_SCHEMA_VERSION {
                     sheet.remove(&mut txn, FREEZE_PANE);
                 }
-                if version < MERGE_EDITS_SCHEMA_VERSION {
-                    sheet.remove(&mut txn, MERGE_EDITS);
-                }
             }
         }
         doc.transact()
@@ -7767,7 +7797,7 @@ mod tests {
     fn known_schema_versions_materialize_and_upgrade_to_current() {
         let model = rich_model();
         for (index, (version, include_defined_names)) in
-            [(3, false), (3, true), (4, true), (5, true), (6, true)]
+            [(3, false), (3, true), (4, true), (5, true)]
                 .into_iter()
                 .enumerate()
         {
@@ -7790,9 +7820,7 @@ mod tests {
     #[test]
     fn legacy_snapshot_merges_into_current_bootstrap() {
         let model = rich_model();
-        for (version, include_defined_names) in
-            [(3, false), (3, true), (4, true), (5, true), (6, true)]
-        {
+        for (version, include_defined_names) in [(3, false), (3, true), (4, true), (5, true)] {
             let update = legacy_update(&model, version, include_defined_names);
             let authority = WorkbookAuthority::from_model_with_client_id(&model, 108).unwrap();
             let staged = authority.stage_updates_v1(&[&update], None).unwrap();
@@ -7959,7 +7987,7 @@ mod tests {
         };
         assert_eq!(
             error,
-            "unsupported schema version 8; supported versions are 3 through 7"
+            "unsupported schema version 7; supported versions are 3 through 6"
         );
     }
 
@@ -8072,11 +8100,279 @@ mod tests {
     }
 
     #[test]
+    fn unused_merge_edits_preserve_schema_six_state_and_identity() {
+        for imported in [false, true] {
+            let mut model = rich_model();
+            if !imported {
+                for sheet in &mut model.sheets {
+                    sheet.merges.clear();
+                }
+            }
+            let mut authority = WorkbookAuthority::from_model_with_client_id(&model, 119).unwrap();
+            let mut oracle =
+                WorkbookAuthority::from_source_oracle(&model, Some(119), &[], None).unwrap();
+            assert_eq!(authority.schema_version().unwrap(), 6);
+            assert_eq!(authority.base.fingerprint, oracle.base.fingerprint);
+            assert_eq!(
+                authority.base.bootstrap_client_id,
+                oracle.base.bootstrap_client_id
+            );
+            assert_eq!(
+                authority.encode_state_as_update_v1(),
+                oracle.encode_state_as_update_v1()
+            );
+            let state = authority.encode_state_as_update_v1();
+            let SnapshotAdoption::Replacement(resumed) = authority.snapshot_replacement(&state)
+            else {
+                panic!("schema six snapshot refused")
+            };
+            assert_eq!(resumed.encode_state_as_update_v1(), state);
+            assert_eq!(resumed.schema_version().unwrap(), 6);
+            let ops = [Op::SetCell {
+                sheet: SheetId(0),
+                at: CellRef::new(20, 0),
+                cell: CellState {
+                    value: CellValue::Text {
+                        value: "edited".into(),
+                    },
+                    ..Default::default()
+                },
+            }];
+            for current in [&mut authority, &mut oracle] {
+                let staged = current
+                    .stage_local_ops_v1(&ops, SyncOrigin::User, &model.styles)
+                    .unwrap();
+                current
+                    .apply_local_update_v1(&staged.update, SyncOrigin::User)
+                    .unwrap();
+            }
+            assert_eq!(
+                authority.encode_state_as_update_v1(),
+                oracle.encode_state_as_update_v1()
+            );
+            for current in [&mut authority, &mut oracle] {
+                current.undo().unwrap().unwrap();
+                let txn = current.doc.transact();
+                let sheets = txn.get_map(SHEETS).unwrap();
+                for (_, sheet) in sheets.iter(&txn) {
+                    let sheet = sheet.cast::<MapRef>().unwrap();
+                    assert!(
+                        sheet
+                            .keys(&txn)
+                            .all(|key| !key.starts_with("merge:") && key != "mergeEdits")
+                    );
+                }
+                assert_eq!(current.schema_version().unwrap(), 6);
+            }
+            assert_eq!(
+                authority.encode_state_as_update_v1(),
+                oracle.encode_state_as_update_v1()
+            );
+        }
+    }
+
+    #[test]
+    fn flat_merge_keys_validate_in_snapshots_and_refuse_schema_six_peers() {
+        let mut model = rich_model();
+        model.sheets[0].merges = vec![
+            CellRange::parse_a1("D4:E5").unwrap(),
+            CellRange::parse_a1("A1:B2").unwrap(),
+        ];
+        let authority = WorkbookAuthority::from_model_with_client_id(&model, 130).unwrap();
+        {
+            let mut txn = authority.doc.transact_mut();
+            let sheets = txn.get_map(SHEETS).unwrap();
+            let sheet = sheets
+                .get(&txn, "sheet:0")
+                .unwrap()
+                .cast::<MapRef>()
+                .unwrap();
+            for (key, present) in [
+                ("merge:C1:C2", true),
+                ("merge:$G$1:$H$2", true),
+                ("merge:J1", false),
+                ("merge:D4:E5", true),
+            ] {
+                sheet.try_update(&mut txn, key, present);
+            }
+        }
+        let (projected, _) = authority.strict_materialize().unwrap();
+        assert_eq!(&projected.sheets[0].merges[..2], model.sheets[0].merges);
+        assert!(authority.materialize_internal_oracle(true).is_err());
+        snapshot_validation::validate_for_test(&authority, projected.clone()).unwrap();
+        assert!(snapshot_validation::validate_for_test(&authority, model).is_err());
+        let peer = WorkbookAuthority::from_model_with_client_id(&projected, 131).unwrap();
+        assert_ne!(authority.base.fingerprint, peer.base.fingerprint);
+    }
+
+    #[test]
+    fn flat_merge_keys_refuse_nested_values_unknown_fields_and_excess_entries() {
+        for kind in [0, 1, 2] {
+            let model = rich_model();
+            let authority = WorkbookAuthority::from_model_with_client_id(&model, 140).unwrap();
+            let original = authority.encode_state_as_update_v1();
+            let peer = Doc::with_client_id(141);
+            hydrate_doc(&peer, &original).unwrap();
+            {
+                let mut txn = peer.transact_mut();
+                let sheets = txn.get_map(SHEETS).unwrap();
+                let sheet = sheets
+                    .get(&txn, "sheet:0")
+                    .unwrap()
+                    .cast::<MapRef>()
+                    .unwrap();
+                match kind {
+                    0 => {
+                        let _: MapRef = sheet.get_or_init(&mut txn, "merge:A1:B2");
+                    }
+                    1 => {
+                        sheet.try_update(&mut txn, "mergeEdits", false);
+                    }
+                    _ => {
+                        for row in 1..=merges::MAX_MERGE_EDITS_PER_SHEET + 1 {
+                            sheet.try_update(&mut txn, format!("merge:Z{row}:AA{row}"), false);
+                        }
+                    }
+                }
+            }
+            let hostile = WorkbookAuthority::hydrated(peer, authority.base.clone(), 0);
+            assert!(hostile.strict_materialize().is_err());
+            assert!(snapshot_validation::validate_for_test(&hostile, model).is_err());
+            assert!(matches!(
+                authority.stage_updates_v1(&[&hostile.encode_state_as_update_v1()], None),
+                Err(AuthorityError::InvalidState(_))
+            ));
+            assert_eq!(authority.encode_state_as_update_v1(), original);
+        }
+    }
+
+    #[test]
+    fn merge_edit_limit_has_identical_strict_and_streaming_projection() {
+        let mut model = WorkbookModel::default();
+        model.sheets.push(Sheet::new("Merges"));
+        let authority = WorkbookAuthority::from_model_with_client_id(&model, 150).unwrap();
+        {
+            let mut txn = authority.doc.transact_mut();
+            let sheets = txn.get_map(SHEETS).unwrap();
+            let sheet = sheets
+                .get(&txn, "sheet:0")
+                .unwrap()
+                .cast::<MapRef>()
+                .unwrap();
+            for row in 1..=merges::MAX_MERGE_EDITS_PER_SHEET {
+                sheet.try_update(&mut txn, format!("merge:A{row}:B{row}"), true);
+            }
+        }
+        let projected = authority.strict_materialize().unwrap().0;
+        assert_eq!(
+            projected.sheets[0].merges.len(),
+            merges::MAX_MERGE_EDITS_PER_SHEET
+        );
+        snapshot_validation::validate_for_test(&authority, projected).unwrap();
+    }
+
+    #[test]
+    fn standalone_full_sync_flattens_merge_edits_into_the_baseline() {
+        let model = rich_model();
+        let mut authority = WorkbookAuthority::from_model_with_client_id(&model, 160).unwrap();
+        let range = CellRange::parse_a1("J1:K2").unwrap();
+        let merge = [Op::MergeCells {
+            sheet: SheetId(0),
+            range,
+        }];
+        let staged = authority
+            .stage_local_ops_v1(&merge, SyncOrigin::User, &model.styles)
+            .unwrap();
+        authority
+            .apply_local_update_v1(&staged.update, SyncOrigin::User)
+            .unwrap();
+        authority
+            .apply_ops(
+                &[Op::UnmergeCells {
+                    sheet: SheetId(0),
+                    range,
+                }],
+                SyncOrigin::User,
+                &model.styles,
+            )
+            .unwrap();
+        assert_eq!(
+            authority.strict_materialize().unwrap().0.sheets[0].merges,
+            model.sheets[0].merges
+        );
+        let txn = authority.doc.transact();
+        let sheets = txn.get_map(SHEETS).unwrap();
+        let sheet = sheets
+            .get(&txn, "sheet:0")
+            .unwrap()
+            .cast::<MapRef>()
+            .unwrap();
+        assert!(sheet.keys(&txn).all(|key| !key.starts_with(MERGE_PREFIX)));
+        let Out::Any(baseline) = sheet.get(&txn, MERGES).unwrap() else {
+            panic!("missing baseline")
+        };
+        assert_eq!(merges_from_any(&baseline).unwrap(), model.sheets[0].merges);
+    }
+
+    #[test]
+    fn concurrent_merge_and_unmerge_of_one_baseline_key_converge() {
+        let mut model = WorkbookModel::default();
+        let mut sheet = Sheet::new("Baseline");
+        sheet.merges.push(CellRange::parse_a1("A1:B2").unwrap());
+        model.sheets.push(sheet);
+        let mut left = WorkbookAuthority::from_model_with_client_id(&model, 170).unwrap();
+        let mut right = WorkbookAuthority::from_model_with_client_id(&model, 171).unwrap();
+        let vector = left.encode_state_vector_v1();
+        for (authority, present) in [(&left, true), (&right, false)] {
+            let mut txn = authority.doc.transact_mut();
+            let sheets = txn.get_map(SHEETS).unwrap();
+            let sheet = sheets
+                .get(&txn, "sheet:0")
+                .unwrap()
+                .cast::<MapRef>()
+                .unwrap();
+            sheet.try_update(&mut txn, "merge:A1:B2", present);
+        }
+        let left_update = left.encode_diff_v1(&vector).unwrap();
+        let right_update = right.encode_diff_v1(&vector).unwrap();
+        for (authority, update) in [(&mut left, right_update), (&mut right, left_update)] {
+            let staged = authority.stage_updates_v1(&[&update], None).unwrap();
+            authority
+                .apply_staged_update_v1(&staged.commit_update)
+                .unwrap();
+        }
+        let projection = left.strict_materialize().unwrap().0;
+        assert_eq!(projection, right.strict_materialize().unwrap().0);
+        for authority in [&left, &right] {
+            snapshot_validation::validate_for_test(authority, projection.clone()).unwrap();
+            let txn = authority.doc.transact();
+            let sheets = txn.get_map(SHEETS).unwrap();
+            let sheet = sheets
+                .get(&txn, "sheet:0")
+                .unwrap()
+                .cast::<MapRef>()
+                .unwrap();
+            let Out::Any(baseline) = sheet.get(&txn, MERGES).unwrap() else {
+                panic!("missing baseline")
+            };
+            assert_eq!(merges_from_any(&baseline).unwrap(), model.sheets[0].merges);
+        }
+    }
+
+    #[test]
     fn malformed_peer_merge_edits_are_refused_without_mutating_the_authority() {
         let model = rich_model();
         for (client_id, key, value) in [
             (113, "A0:B2", Any::Bool(true)),
             (114, "A1:B2", Any::from("true")),
+            (115, "a1:b2", Any::Bool(true)),
+            (116, "B2:A1", Any::Bool(true)),
+            (117, "A1:A1", Any::Bool(true)),
+            (118, "A1:XFE2", Any::Bool(true)),
+            (119, "A1:B1048577", Any::Bool(true)),
+            (120, "", Any::Bool(true)),
+            (121, "A1:B2", Any::Null),
+            (122, "A1:B2", Any::from(1)),
         ] {
             let authority =
                 WorkbookAuthority::from_model_with_client_id(&model, client_id).unwrap();
@@ -8090,15 +8386,18 @@ mod tests {
                     .get(&txn, "sheet:0")
                     .and_then(|value| value.cast::<MapRef>().ok())
                     .unwrap();
-                let edits = nested_map(&sheet, &txn, MERGE_EDITS).unwrap();
-                edits.try_update(&mut txn, key, value);
+                sheet.try_update(&mut txn, format!("{MERGE_PREFIX}{key}"), value);
             }
             let update = peer.transact().encode_diff_v1(&before);
+            let original = authority.encode_state_as_update_v1();
+            let hostile = WorkbookAuthority::hydrated(peer, authority.base.clone(), 0);
+            assert!(snapshot_validation::validate_for_test(&hostile, model.clone()).is_err());
             assert!(matches!(
                 authority.stage_updates_v1(&[&update], None),
                 Err(AuthorityError::InvalidState(_))
             ));
             assert_eq!(authority.strict_materialize().unwrap().0, model);
+            assert_eq!(authority.encode_state_as_update_v1(), original);
         }
     }
 
@@ -8113,6 +8412,13 @@ mod tests {
         assert_eq!(
             project_merges(baseline.clone(), &edits, &doc.transact()).unwrap(),
             baseline
+        );
+        edits.try_update(&mut doc.transact_mut(), "merge:C1:C2", true);
+        let mut expected = baseline;
+        expected.push(CellRange::parse_a1("C1:C2").unwrap());
+        assert_eq!(
+            project_merges(expected[..2].to_vec(), &edits, &doc.transact()).unwrap(),
+            expected
         );
     }
 
